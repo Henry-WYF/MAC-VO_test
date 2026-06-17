@@ -1,6 +1,6 @@
 #
-# MAC-VO Fast Mode with optional terminate-time global pose graph optimization.
-# This config keeps the original frontend/local optimizer choices and only adds
+# MAC-VO Performant mode with optional terminate-time global pose graph optimization.
+# This config keeps the Performant frontend/local optimizer choices and only adds
 # Odometry.global_pgo as an explicit sibling key.
 #
 
@@ -9,7 +9,7 @@ Common:
   device: &device cuda
 
 Odometry:
-  name: MACVO-GlobalPGO
+  name: MACVO-Performant-GlobalPGO
   args:
     # Device directive to the VO system
     # NOTE: the system may not follow this device config strictly since some module
@@ -61,8 +61,8 @@ Odometry:
     args:
       device: *device
       weight: ./Model/MACVO_FrontendCov.pth
-      enc_dtype: fp16
-      dec_dtype: bf16
+      enc_dtype: fp32
+      dec_dtype: fp32
       decoder_depth: 12
       enforce_positive_disparity: false
 
