@@ -54,6 +54,7 @@ class GTMotionwithNoise(IMotionModel[StereoFrame]):
     def init_context(self) -> None: return None
     
     def _stableNoiseModel(self) -> pp.LieTensor:
+        """生成随机 SE3 噪声：若 noise_std=0.0 则返回单位阵，否则在 SE3 上采样高斯噪声"""
         if self.config.noise_std == 0.0:
             return pp.identity_SE3()
         noise: pp.LieTensor = pp.randn_SE3(sigma=self.noise_std)    #type:ignore
@@ -159,6 +160,7 @@ class ReadPoseFile(IMotionModel[StereoFrame]):
         self.poses: pp.LieTensor = self.load_poses()
     
     def load_poses(self) -> pp.LieTensor:
+        """从文件中加载位姿序列，支持 .npy / .pt / .pth / .txt 格式（N×7 SE3 矩阵）"""
         pose_file = Path(self.config.pose_file)
         if not pose_file.exists():
             Logger.write("error", f"Cannot read pose file at {pose_file} - File Not Exist!")

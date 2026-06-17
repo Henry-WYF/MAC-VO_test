@@ -7,6 +7,13 @@ from .covhead import MemoryCovDecoder
 
 
 class FlowFormerCov(FlowFormer):
+    """
+    改进的 FlowFormer 网络：在原 FlowFormer 基础上替换 MemoryDecoder 为 MemoryCovDecoder，
+    使其能同时输出光流预测和对应的协方差（不确定性）估计。
+
+    encoder 和 decoder 可分别配置不同的精度（如 fp16 编码 + fp32 解码），
+    在速度与精度之间灵活权衡。
+    """
     def __init__(self, cfg, encoder_dtype: torch.dtype=torch.float32, decoder_dtype: torch.dtype=torch.float32):
         super(FlowFormerCov, self).__init__(cfg)
         self.memory_decoder = MemoryCovDecoder(self.cfg, decoder_dtype)

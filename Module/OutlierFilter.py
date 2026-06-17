@@ -42,6 +42,7 @@ class IObservationFilter(ABC, ConfigTestableSubclass):
 
 
 class FilterCompose(IObservationFilter):
+    """组合多个滤波器，串联执行：只有通过所有子滤波器的观测才被保留"""
     def __init__(self, config: SimpleNamespace):
         super().__init__(config)
         self.filters = [
@@ -78,6 +79,7 @@ class FilterCompose(IObservationFilter):
 
 
 class IdentityFilter(IObservationFilter):
+    """恒等滤波器：不做任何过滤，保留所有观测"""
     @property
     def required_keys(self) -> set[LiteralString]: return set()
     
@@ -89,6 +91,7 @@ class IdentityFilter(IObservationFilter):
 
 
 class CovarianceSanityFilter(IObservationFilter):
+    """协方差异常检测：去除包含 NaN 或 Inf 协方差的观测（数值不稳定导致的退化观测）"""
     @property
     def required_keys(self) -> set[LiteralString]: return {"obs1_covTc", "obs2_covTc"}
     
@@ -104,6 +107,7 @@ class CovarianceSanityFilter(IObservationFilter):
 
 
 class SimpleDepthFilter(IObservationFilter):
+    """深度范围过滤：去除深度值超出 [min_depth, max_depth] 范围的观测。max_depth 设为 "auto" 时自动使用 (fx * baseline)"""
     def set_meta(self, meta: StereoData):
         if self.config.max_depth == "auto":
             self.config.max_depth = meta.fx * meta.frame_baseline
@@ -128,6 +132,11 @@ class SimpleDepthFilter(IObservationFilter):
 
 
 class LikelyFrontOfCamFilter(IObservationFilter):
+    """前方判定过滤：以 2-sigma 置信度确保观测点在相机前方（深度 > 0）。
+
+    即 depth - 2*σ_depth > 0 才保留，避免因深度非正导致的数值异常。
+    如果没有协方差估计（用 -1 占位），则不做过滤。
+    """
     @property
     def required_keys(self) -> set[LiteralString]: return {"pixel1_d", "pixel1_d_cov", "pixel2_d", "pixel2_d_cov"}
     

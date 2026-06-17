@@ -6,7 +6,10 @@ from ..FlowFormer.core.decoder import MemoryDecoder, initialize_flow
 
 
 class CovHead(nn.Module):
+    """协方差预测头：通过 4 层卷积 (ReLU+Conv) 将隐藏特征映射为 2 通道对数方差 (log-variance) 输出。
 
+    输出 2 通道分别对应 σ²_u 和 σ²_v（光流 u、v 方向的对数方差）。
+    """
     def __init__(self, input_dim=128, hidden_dim=256):
         super(CovHead, self).__init__()
         self.conv1 = nn.Conv2d(input_dim, hidden_dim, 3, padding=1)
@@ -22,7 +25,13 @@ class CovHead(nn.Module):
 
 
 class CovUpdateBlock(nn.Module):
+    """协方差更新模块：结合 GRU 迭代更新和 CovHead 预测，输出协方差的增量 delta_cov。
 
+    内部包含：
+      - SepConvGRU: 对协方差隐藏状态做门控更新
+      - CovHead: 从隐藏状态生成 delta_cov（对数方差空间）
+      - mask: 生成上采样掩码（用于后续光流/协方差上采样）
+    """
     def __init__(self, args, hidden_dim=128):
         super().__init__()
         self.args = args
@@ -44,6 +53,11 @@ class CovUpdateBlock(nn.Module):
 
 
 class MemoryCovDecoder(MemoryDecoder):
+    """扩展的 MemoryDecoder：在标准 FlowFormer 解码器的基础上增加协方差解码分支。
+
+    与 MemoryDecoder 共享 flow_net 和 GRU 的 inp_cat 输入，通过独立的 CovUpdateBlock
+    并行预测协方差的迭代更新。两个分支共享编码特征但不共享更新权重。
+    """
     def __init__(self, cfg, decoder_dtype: torch.dtype):
         super(MemoryCovDecoder, self).__init__(cfg)
         self.cov_update = CovUpdateBlock(self.cfg, hidden_dim=128)

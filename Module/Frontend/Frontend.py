@@ -129,6 +129,11 @@ class CUDAGraphHandler:
 # Implementations
 
 class FrontendCompose(IFrontend):
+    """组合式前端：将独立的 IStereoDepth 和 IMatcher 模块组合为一个 IFrontend。
+
+    适用于深度和匹配使用不同网络的场景（如 TartanVO + FlowFormer 组合）。
+    每次调用顺序执行两个模块，不做联合批处理优化。
+    """
     def __init__(self, config: SimpleNamespace):
         super().__init__(config)
         self.depth = IStereoDepth.instantiate(self.config.depth.type, self.config.depth.args)
@@ -157,6 +162,16 @@ class FrontendCompose(IFrontend):
 
 
 class FlowFormerCovFrontend(IFrontend):
+    """
+    MAC-VO 的主前端实现：使用改进的 FlowFormer 网络联合估计双目深度和时序光流。
+
+    通过批处理策略，单次网络前向传播同时输出：
+      - 双目视差（→ 深度 + 深度协方差）
+      - 时序光流（→ 匹配 + 光流协方差）
+
+    estimate_pair() 将 (imageL_t2, imageL_t1) 和 (imageR_t2, imageL_t2) 拼成 B=2 的 batch，
+    一次推理后拆分输出为深度和光流。
+    """
     TENSOR_RT_AOT_RESULT_PATH = Path("./cache/FlowFormerCov_TRTCache")
     T_SUPPORT_DTYPE = Literal["fp32", "bf16", "fp16"]
     

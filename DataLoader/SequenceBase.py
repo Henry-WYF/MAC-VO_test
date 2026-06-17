@@ -5,6 +5,8 @@ from typing_extensions import Self
 
 import numpy as np
 import multiprocessing as mp
+# torch.utils.data.IterableDataset：将序列暴露为可迭代数据集
+# 相比于映射式数据集 Dataset，更适于流式数据加载，支持动态生成数据、无限长度序列等场景
 from torch.utils.data import IterableDataset
 from concurrent.futures import ThreadPoolExecutor
 
@@ -14,7 +16,8 @@ from Utility.Config import build_dynamic_config
 from .Interface import T_Data
 from .Transform import IDataTransform
 
-
+# 数据层抽象    SequenceBase 序列基类
+# T_Data 类型变量，帧数据类型 DataFrame 及其子类
 class SequenceBase(IterableDataset[T_Data], ABC, ConfigTestableSubclass):
     @classmethod
     def name(cls) -> str:
@@ -43,13 +46,16 @@ class SequenceBase(IterableDataset[T_Data], ABC, ConfigTestableSubclass):
 
     @final
     def clip(self, start_idx: int | None = None, end_idx: int | None = None, step: int | None = None) -> Self:
+        """截取序列的子区间（类似列表切片），返回 self 支持链式调用"""
         self.indices = self.indices[start_idx:end_idx:step]
         return self
 
     def preload(self) -> "PreloadedSequence[T_Data]":
+        """将整个序列预加载到内存中，使用多线程加速 I/O，避免运行时磁盘读取瓶颈"""
         return PreloadedSequence(self)
-    
+
     def transform(self, actions: list[Callable[[T_Data,], T_Data]] | Callable[[T_Data,], T_Data]) -> "TransformSequence[T_Data] | Self":
+        """对序列的每一帧应用数据变换（如缩放、裁剪、归一化），返回新的 TransformSequence"""
         if isinstance(actions, list) and len(actions) == 0: return self
         return TransformSequence(self, actions)
 
@@ -62,6 +68,7 @@ class SequenceBase(IterableDataset[T_Data], ABC, ConfigTestableSubclass):
     def __repr__(self) -> str:
         return f"{self.name()}(orig_len={self.origin_length}, clip_len={len(self)})"
     
+    # 变量 T_Data ,由 interface.py 定义，继承自 Collatable类，具有 collate 方法，支持批处理拼接
     @staticmethod
     def collate_fn(batch: list[T_Data]) -> T_Data:
         """
@@ -76,6 +83,7 @@ class SequenceBase(IterableDataset[T_Data], ABC, ConfigTestableSubclass):
 
 
 class PreloadedSequence(SequenceBase[T_Data]):
+    """预加载序列包装器：将原序列的全部帧一次性加载到内存 frame buffer 中，__getitem__ 直接从 buffer 读取"""
     def __init__(self, generic_seq: SequenceBase[T_Data]):
         self.sequence = generic_seq
         
@@ -96,7 +104,8 @@ class PreloadedSequence(SequenceBase[T_Data]):
 
 
 class TransformSequence(SequenceBase[T_Data]):
-    def __init__(self, original_seq: SequenceBase[T_Data], 
+    """变换序列包装器：在 __getitem__ 时依次应用数据变换链（如缩放→裁剪→归一化），惰性执行"""
+    def __init__(self, original_seq: SequenceBase[T_Data],
                  actions: list[Callable[[T_Data,], T_Data]] | Callable[[T_Data,], T_Data]) -> None:
         super().__init__(len(original_seq))
         self.original_seq = original_seq
@@ -118,6 +127,7 @@ class TransformSequence(SequenceBase[T_Data]):
 
 
 def smart_transform(seq: SequenceBase[T_Data], trans_cfg: SimpleNamespace | dict[str, Any] | list) -> SequenceBase[T_Data]:
+    # 将配置字典转换为 SimpleNamespace 对象，方便属性访问（类访问）
     if isinstance(trans_cfg, dict):
         trans_cfg = build_dynamic_config(trans_cfg)[0]
     elif isinstance(trans_cfg, list):

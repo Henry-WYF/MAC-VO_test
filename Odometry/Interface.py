@@ -23,6 +23,18 @@ class IOdometry(ABC, Generic[T_Data]):
         self.profile_save_path = "trace_parallel.json"
     
     def receive_frames(self, sequence: SequenceBase[T_Data], saveto: Sandbox, on_frame_finished: None | Callable[[T_Data, Self, ColoredTqdm], None]=None):
+        """
+        主运行循环：逐帧处理序列数据，运行 VO 并保存结果。
+
+        流程：
+          1. 逐帧调用 self.run(frame) 进行视觉里程计
+          2. 可选：在第 2 帧启用 PyTorch Profiler 进行性能分析
+          3. 收集 ground truth 参考位姿（如果数据提供）
+          4. 每帧完成后调用 on_frame_finished 回调（用于可视化和 VRAM 监控）
+          5. 序列处理完毕后调用 self.terminate() 结束优化
+          6. 将传感器位姿转换到机体坐标系，保存到 poses.npy
+          7. 将完整因子图序列化到 tensor_map.npz
+        """
         try:
             reference_poses, reference_time = [], []
             pb = ColoredTqdm(sequence)

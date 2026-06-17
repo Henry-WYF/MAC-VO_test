@@ -9,6 +9,14 @@ from .pwc.pwc_model import PWCDCNet
 
 
 class PWCFeature(PWCDCNet):
+    """PWC-Net 特征编码器：构建 6 层图像金字塔并通过代价体积 (correlation volume) 估计光流。
+
+    采用从粗到细（coarse-to-fine）策略：
+      1. 在最低分辨率 (1/64) 计算初始光流
+      2. 逐层上采样光流并 warp 特征图
+      3. 在更高分辨率层计算残差光流
+    最终输出 flow2 (1/4 分辨率)、context（上下文特征）、memory（中间隐藏状态）。
+    """
     def __init__(self, md=4, flow_norm=20.0):
         super(PWCFeature, self).__init__(md=md, flow_norm=flow_norm)
         self.memory = None

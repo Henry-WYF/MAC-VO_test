@@ -78,6 +78,14 @@ class TensorBundle(T.Generic[T_Fields]):
 
 @T.no_type_check    # Jaxtyping and typeguard does not support StringLiteral well.
 class AutoScalingBundle(TensorBundle[T_Fields]):
+    """
+    TensorBundle 的自动扩容版本，使用 AutoScalingTensor 替代普通 torch.Tensor。
+
+    当 push() 新数据超出当前容量时，所有张量自动翻倍扩容，无需手动管理内存。
+    同时维护从该节点出发的所有边（edges_from），push 时自动为每条边追加空槽位。
+
+    注意：__getitem__ 返回的是普通的 TensorBundle（非自动扩容版本）。
+    """
     def __init__(self, index: AutoScalingTensor, data: dict[T_Fields, AutoScalingTensor]):
         self.index = index
         self.data  = data
@@ -182,13 +190,20 @@ class DenseEdge_Multi(EdgeLike):
         self.num_ranges[from_idx] += 1
     
     def project(self, from_index: torch.Tensor) -> torch.Tensor:
+        """将压缩存储的 (start, length) 区间展开为完整的 to_index 列表。
+
+        存储格式：ranges[from_idx, range_idx] = [start_idx, length]
+        例如 ranges = [[0,3], [5,2]] 表示两个区间：[0,1,2] 和 [5,6]，
+        展开后合并为 [0,1,2,5,6]。
+        """
         offsets = self.ranges[from_index, :, 0].flatten()
         offsets = offsets[offsets >= 0]
-        
+
         lengths = self.ranges[from_index, :, 1].flatten()
         lengths = lengths[lengths >= 0]
-        
+
         if torch.any(lengths > 0):
+            # 将每个区间展开为连续的索引序列
             expanded_offsets = torch.repeat_interleave(offsets, lengths)
             range_indices    = torch.arange(lengths.sum().item())
             range_starts     = torch.repeat_interleave(lengths.cumsum(0) - lengths, lengths)
@@ -216,7 +231,8 @@ class DenseEdge_Multi(EdgeLike):
 
 class SingleEdge(EdgeLike):
     """
-    A one-to-one mapping relationship between
+    一对一映射边。每个源元素最多映射到一个目标元素。
+    例如 match2point 边：每条 MatchObs 对应唯一的 PointNode。
     """
     def __init__(self, num_elem: int) -> None:
         self.mapping = torch.empty((num_elem,), dtype=torch.long).fill_(-1)
@@ -242,6 +258,7 @@ class SingleEdge(EdgeLike):
 
 
 class Scaling_SparseEdge_Multi(SparseEdge_Multi):
+    """自动扩容版 SparseEdge_Multi，使用 AutoScalingTensor 存储边数据"""
     def __init__(self, num_from: int, max_deg: int):
         self.out_deg = AutoScalingTensor((num_from,), grow_on=0, dtype=torch.long, init_val=0)
         self.edges   = AutoScalingTensor((num_from, max_deg), grow_on=0, dtype=torch.long, init_val=-1)
@@ -263,6 +280,7 @@ class Scaling_SparseEdge_Multi(SparseEdge_Multi):
 
 
 class Scaling_DenseEdge_Multi(DenseEdge_Multi):
+    """自动扩容版 DenseEdge_Multi，使用 AutoScalingTensor 存储边数据。用于 frame2match / frame2map 等一对多密集边"""
     def __init__(self, num_from: int, max_deg: int) -> None:
         self.ranges     = AutoScalingTensor((num_from, max_deg, 2), grow_on=0, dtype=torch.long, init_val=-1)
         self.num_ranges = AutoScalingTensor((num_from,), grow_on=0, dtype=torch.long, init_val=0)
@@ -283,6 +301,7 @@ class Scaling_DenseEdge_Multi(DenseEdge_Multi):
 
 
 class Scaling_SingleEdge(SingleEdge):
+    """自动扩容版 SingleEdge，使用 AutoScalingTensor 存储映射。用于 match2point / match2frame1/2 等一对一映射边"""
     def __init__(self, num_elem: int) -> None:
         self.mapping = AutoScalingTensor((num_elem,), grow_on=0, dtype=torch.long, init_val=-1)
     

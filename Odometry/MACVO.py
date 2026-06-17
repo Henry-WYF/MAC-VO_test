@@ -38,6 +38,7 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
         post_process    : Module.IMapProcessor,
         kf_selector     : Module.IKeyframeSelector[T_SensorFrame],
         optimizer       : Module.IOptimizer,
+        global_pgo      : Module.GlobalPoseGraphOptimizer | None = None,
         **_excessive_args,
     ) -> None:
         super().__init__(profile=profile)
@@ -59,6 +60,7 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
         self.MapRefiner = post_process
         self.KeyframeSelector = kf_selector
         self.Optimizer = optimizer
+        self.GlobalPGO = global_pgo
         # end
 
         self.min_num_point = 10
@@ -90,6 +92,12 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
         MapRefiner          = Module.IMapProcessor.instantiate(odomcfg.postprocess.type, odomcfg.postprocess.args)
         KeyframeSelector    = Module.IKeyframeSelector[T_SensorFrame].instantiate(odomcfg.keyframe.type, odomcfg.keyframe.args)
         Optimizer           = Module.IOptimizer.instantiate(odomcfg.optimizer.type, odomcfg.optimizer.args)
+        global_pgo_cfg      = getattr(odomcfg, "global_pgo", None)
+        GlobalPGO           = (
+            Module.GlobalPoseGraphOptimizer(global_pgo_cfg)
+            if global_pgo_cfg is not None and bool(getattr(global_pgo_cfg, "enabled", False))
+            else None
+        )
         
         return cls(
             frontend=Frontend,
@@ -101,6 +109,7 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
             post_process=MapRefiner,
             kf_selector=KeyframeSelector,
             optimizer=Optimizer,
+            global_pgo=GlobalPGO,
             **vars(odomcfg.args),
         )
     
@@ -127,6 +136,7 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
                     f"MappointSelector-'{self.MappointSelector.__class__.__name__}'",
                     f"OutlierFilter   -'{self.OutlierFilter   .__class__.__name__}'",
                     f"MapRefiner      -'{self.MapRefiner      .__class__.__name__}'",
+                    f"GlobalPGO       -'{self.GlobalPGO.__class__.__name__ if self.GlobalPGO is not None else 'disabled'}'",
                 ]
             ),
             title="Odometry Modules",
@@ -145,6 +155,8 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
         Module.ICovariance2to3.is_valid_config(config.cov.obs)
         Module.IFrontend.is_valid_config(config.frontend)
         Module.IOptimizer.is_valid_config(config.optimizer)
+        if hasattr(config, "global_pgo"):
+            Module.GlobalPoseGraphOptimizer.is_valid_config(config.global_pgo)
         
         cls._enforce_config_spec(config.args, {
             "device"            : lambda s: isinstance(s, str) and (("cuda" in s) or (s == "cpu")),
@@ -156,6 +168,7 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
         })
 
     def initialize(self, frame0: T_SensorFrame):
+        """初始化 MAC-VO：估计第一帧深度、注册首帧到因子图、设置首帧为关键帧"""
         depth0          = self.Frontend.estimate_depth(frame0.stereo)
         est_pose        = self.MotionEstimator.predict(frame0, None, depth0.depth).unsqueeze(0)
         
@@ -171,6 +184,22 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
         self.prev_keyframe = (frame0, int(frame_idx.item()), depth0)
 
     def run_pair(self, frame0: T_SensorFrame, frame1: T_SensorFrame) -> None:
+        """
+        MAC-VO 核心算法：处理一对帧 (frame0=上一关键帧, frame1=当前帧)。
+
+        执行流程（对应论文 Section III）：
+          1. 关键帧判断：如果 frame1 不是关键帧，仅插值位姿并跳过
+          2. 前端估计：联合推理 frame0→frame1 的光流和 frame1 的双目深度（含协方差）
+          3. 优化回写：将上一轮 PGO 优化结果写入全局地图
+          4. 运动预测：运动模型给出 frame1 的初始位姿估计
+          5. 关键点选择：在 frame0 上选择 N 个协方差感知的关键点
+          6. 深度/光流检索：在稠密图上采样关键点处的深度、光流及其协方差
+          7. 2D→3D 投影：将像素坐标反投影为相机坐标系 3D 点，并传播协方差 Σ_3D
+          8. 外点过滤：去除协方差异常或几何不一致的观测
+          9. 因子图注册：将 Frame/Match/Point 节点及其有向边写入 VisualMap
+          10. 启动优化：以 Σ⁻¹ 为信息矩阵运行 LM-PGO 优化当前帧位姿
+          11. 可选：在 mapping 模式下添加稠密地图点
+        """
         assert self.prev_keyframe is not None
         
         # Check if current frame is the keyframe ########################################
@@ -337,6 +366,7 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
             self.graph.frame2map.add(frame_idx, torch.tensor([num_map_orig], dtype=torch.long), torch.tensor([num_mappoint], dtype=torch.long))   # Associate frame -> map
 
     def push_keyframe(self, frame: T_SensorFrame, est_pose: pp.LieTensor | torch.Tensor, need_interp: bool=False) -> torch.Tensor:
+        """将一帧注册到 VisualMap，返回该帧的全局索引"""
         frame_idx = self.graph.frames.push(FrameNode.init({
             "pose"        : est_pose,
             "T_BS"        : frame.stereo.T_BS,
@@ -371,10 +401,13 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
         return self.graph
 
     def terminate(self) -> None:
+        """终止 VO：回写最后一批优化结果，关闭优化器，执行地图后处理（插值/平滑）"""
         super().terminate()
         if self.prev_keyframe is not None:
             self.Optimizer.write_map(self.graph)
         self.Optimizer.terminate()
+        if self.GlobalPGO is not None and self.GlobalPGO.optimize_on_terminate:
+            self.GlobalPGO.run_on_terminate(self.graph)
         self.MapRefiner.elaborate_map(self.graph.frames)
 
     def register_on_optimize_finish(self, func: T_SYSHOOK):

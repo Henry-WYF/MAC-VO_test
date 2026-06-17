@@ -258,6 +258,18 @@ class CovAwareSelector(IKeypointSelector):
     @Timer.gpu_timeit("KPSelector.select")
     @torch.inference_mode()
     def select_point(self, frame: StereoData, numPoint: int, depth0_est: IStereoDepth.Output, depth1_est: IStereoDepth.Output, match_est: IMatcher.Output | None) -> torch.Tensor:
+        """
+        MAC-VO 协方差感知的关键点选择算法（论文 Section III.B）。
+
+        构建质量图筛选最佳关键点候选：
+          1. quality = σ²_depth0 + σ²_depth1  （深度协方差越小越好）
+          2. 若光流协方差可用：quality *= (σ²_u + σ²_v - 2σ_uv)  （光流协方差越小越好）
+          3. 对 quality 做 NMS（非极大值抑制）确保空间上分散
+          4. 多层掩码过滤：边界 -> 深度范围 -> 深度协方差阈值 -> 光流协方差阈值
+          5. 从通过筛选的候选中随机采样 numPoint 个点
+
+        返回: N×2 tensor，每行为 (u, v) 像素坐标。
+        """
         assert depth0_est.cov is not None
         assert depth1_est.cov is not None
         if self.config.max_depth == "auto": self.config.max_depth = frame.fx * frame.frame_baseline

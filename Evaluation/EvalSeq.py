@@ -24,6 +24,15 @@ NEED_ALIGN_SCALE: dict[str, Literal["Dynamic"] | float] = {
 }
 
 def EvaluateSequences(spaces: list[str], correct_scale=False):
+    """
+    批量评估轨迹序列，计算 ATE / RTE / ROE / RPE 指标。
+
+    参数:
+      - spaces: Sandbox 路径列表，每个路径应包含 poses.npy 和 ref_poses.npy
+      - correct_scale: 是否在校准过程中修正尺度因子
+
+    返回: (表头列表, 结果列表)，每行结果包含各指标的 mean/std/rmse
+    """
     eval_results = []
     DECORATOR = "[S]" if correct_scale else ""
 

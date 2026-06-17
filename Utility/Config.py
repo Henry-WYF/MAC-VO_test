@@ -72,6 +72,9 @@ def __build_dynamic_config(spec: DynamicConfigSpec):
 
 
 def build_dynamic_config(spec: DynamicConfigSpec):
+    """构建动态配置：递归解析所有 LoadFrom 引用（!include 标签），
+    然后转换为 SimpleNamespace。返回 (namespace, dict) 形式。
+    """
     cfg = __build_dynamic_config(spec)
     return asNamespace(cfg), cfg
 
@@ -97,6 +100,11 @@ def namespace_to_cfgnode(ns: SimpleNamespace):
 
 
 def asNamespace(dictionary) -> types.SimpleNamespace:
+    """递归地将嵌套 dict 转为 SimpleNamespace，支持属性访问语法 (config.a.b.c)。
+
+    实现技巧：通过 json.dumps + json.loads 的 object_hook 完成递归转换，
+    避免了手动递归处理 dict 的复杂性。
+    """
     def load_object(obj):
         if isinstance(obj, dict):
             for k in obj:

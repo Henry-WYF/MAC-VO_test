@@ -424,6 +424,16 @@ def Covariance_2to3_full(
 
 
 def create_3x3_matrix(matrix: list[list[torch.Tensor | float]], n_sample: int, device: torch.device):
+    """
+    将 3×3 的协方差分量列表组装为 (N, 3, 3) 批量矩阵。
+
+    参数:
+        matrix: 3×3 二维列表，每个元素为 (N,) 的 Tensor 或标量
+        n_sample: 批量大小 N
+        device: 输出张量所在设备
+    返回:
+        torch.Tensor of shape (N, 3, 3)
+    """
     assert len(matrix) == 3 and len(matrix[0]) == 3 and len(matrix[1]) == 3 and len(matrix[2]) == 3
     mat = torch.empty((n_sample, 3, 3))
     
@@ -434,6 +444,18 @@ def create_3x3_matrix(matrix: list[list[torch.Tensor | float]], n_sample: int, d
 
 
 def create_2x2_matrix(matrix: list[list[torch.Tensor | float]], n_sample: int, device: torch.device):
+    """
+    将 2×2 的协方差分量列表组装为 (N, 2, 2) 批量矩阵。
+
+    用于构建像素平面上的 (u, v) 协方差矩阵，如 flow 不确定性。
+
+    参数:
+        matrix: 2×2 二维列表，每个元素为 (N,) 的 Tensor 或标量
+        n_sample: 批量大小 N
+        device: 输出张量所在设备
+    返回:
+        torch.Tensor of shape (N, 2, 2)
+    """
     assert len(matrix) == 2 and len(matrix[0]) == 2 and len(matrix[1]) == 2
     mat = torch.empty((n_sample, 2, 2), device=device)
     

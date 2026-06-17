@@ -1,8 +1,12 @@
 import torch
 import pypose as pp
 
+# 坐标系说明：
+#   NED (World): +x=North, +y=East, +z=Down
+#   EDN (pypose): 默认输出 EDN 坐标 → 通过 roll/shift 转为 NED
 
 def filterPointsInRange(pts1:torch.Tensor, u_range: tuple[int, int], v_range: tuple[int, int]) -> torch.Tensor:
+    """过滤超出图像范围的关键点，返回布尔掩码 (N,)，True 表示在图像范围内"""
     u_min, u_max = u_range
     v_min, v_max = v_range
 

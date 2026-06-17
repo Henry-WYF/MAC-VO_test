@@ -1,0 +1,51 @@
+已按最终 prompt 完成第一阶段实现。
+
+改动文件：
+- 新增 [Graph.py](C:/Users/lenovo/Desktop/code/SLAM/MAC-VO/MAC-VO-test/Module/Optimization/GlobalPGO/Graph.py)
+- 新增 [Optimizer.py](C:/Users/lenovo/Desktop/code/SLAM/MAC-VO/MAC-VO-test/Module/Optimization/GlobalPGO/Optimizer.py)
+- 新增 [__init__.py](C:/Users/lenovo/Desktop/code/SLAM/MAC-VO/MAC-VO-test/Module/Optimization/GlobalPGO/__init__.py)
+- 修改 [Module/Optimization/__init__.py](C:/Users/lenovo/Desktop/code/SLAM/MAC-VO/MAC-VO-test/Module/Optimization/__init__.py)
+- 修改 [Module/__init__.py](C:/Users/lenovo/Desktop/code/SLAM/MAC-VO/MAC-VO-test/Module/__init__.py)
+- 修改 [MACVO.py](C:/Users/lenovo/Desktop/code/SLAM/MAC-VO/MAC-VO-test/Odometry/MACVO.py)
+- 新增配置 [MACVO_GlobalPGO.yaml](C:/Users/lenovo/Desktop/code/SLAM/MAC-VO/MAC-VO-test/Config/Experiment/MACVO/MACVO_GlobalPGO.yaml)
+- 新增测试 [test_global_pgo.py](C:/Users/lenovo/Desktop/code/SLAM/MAC-VO/MAC-VO-test/Scripts/UnitTest/test_global_pgo.py)
+
+已实现：
+- `GlobalPoseGraphOptimizer`
+- `PoseGraphEdge`
+- `register_odometry_edges()`
+- `add_loop_edge()`
+- `compute_residuals()`
+- `compute_loss()`
+- `optimize_global()`
+- `write_back()`
+- `run_on_terminate()`
+- `include_interp_frames` 行为
+- loop edge 参与 loss
+- 第一帧固定：只优化 `poses[1:]`
+- `optimize_global` 只返回结果，`write_back` 才写 map
+- `MACVO.from_config()` 条件式读取 `Odometry.global_pgo`
+- `MACVO.is_valid_config()` 对旧配置做 `hasattr(config, "global_pgo")` 保护
+- `MACVO.terminate()` 只在 `self.GlobalPGO is not None and optimize_on_terminate` 时调用
+
+本地验证结果：
+- AST 语法检查通过：`ast ok`
+- `pytest` 未安装：`No module named pytest`
+- `pypose` 未安装
+- `yaml` 未安装
+- `pyright` 不在 PATH
+- `py_compile` 因本地 `__pycache__` 写入权限被拒绝，已改用不写文件的 AST 检查
+
+后续服务器建议先跑：
+```bash
+pytest Scripts/UnitTest/test_global_pgo.py -q
+pytest Scripts/UnitTest/test_config_macvo.py -q
+python MACVO.py --odom Config/Experiment/MACVO/MACVO_GlobalPGO.yaml --data Config/Sequence/TartanAir_example.yaml
+```
+
+后续接真实回环检测的入口是：
+```python
+GlobalPoseGraphOptimizer.add_loop_edge(src, dst, relative_pose, information=None)
+```
+
+目标已完成。用时约 9 分 40 秒，累计 token 用量 160992。

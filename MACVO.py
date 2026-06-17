@@ -1,22 +1,29 @@
-import argparse
+import argparse             # 解析命令行参数
 import torch
-import rerun as rr
+import rerun as rr          # 可视化工具
 import numpy as np
-import pypose as pp
-from pathlib import Path
+import pypose as pp         # 李群位姿表示（SE3）
+from pathlib import Path    # 路径操作
 
-from DataLoader import SequenceBase, StereoFrame, smart_transform
+# 数据层抽象    SequenceBase 序列基类
+#              StereoFrame  立体帧数据类
+#              smart_trans  对序列进行预处理变换（如裁剪、增强）
+from DataLoader import SequenceBase, StereoFrame, smart_transform   
 from Evaluation.EvalSeq import EvaluateSequences
 from Odometry.MACVO import MACVO
 
+# 工具库
 from Utility.Config import load_config, asNamespace
 from Utility.PrettyPrint import print_as_table, ColoredTqdm, Logger
 from Utility.Sandbox import Sandbox
 from Utility.Visualize import fig_plt, rr_plt
 from Utility.Timer import Timer
 
-
+# 可视化回调函数，在每一帧处理完成后被调用，用于向 Rerun 可视化工具推送数据
 def VisualizeRerunCallback(frame: StereoFrame, system: MACVO, pb: ColoredTqdm):
+                        # 在 Python 中，冒号 : 用于类型注解 (Type Annotation)，它指定了变量、参数或返回值的预期数据类型
+                        # 在函数定义中，参数名: 类型 的语法告诉阅读者和工具，这个参数应该接受什么类型的对象
+                        # 这里的 frame 是 StereoFrame类 的一个实例
     rr.set_time_sequence("frame_idx", frame.frame_idx)
     
     # Non-key frame does not need visualization
@@ -34,7 +41,7 @@ def VisualizeRerunCallback(frame: StereoFrame, system: MACVO, pb: ColoredTqdm):
     vo_points  = system.graph.get_match2point(system.graph.get_frame2match(system.graph.frames[-1:]))
     rr_plt.log_points("/world/vo_tracking", vo_points.data["pos_Tw"], vo_points.data["color"], vo_points.data["cov_Tw"], "sphere")
     
-
+# 显存监控
 def VisualizeVRAMUsage(frame: StereoFrame, system: MACVO, pb: ColoredTqdm):
     if torch.cuda.is_available():
         allocated_memory = torch.cuda.memory_reserved(0) / 1e9  # Convert to GB
@@ -124,6 +131,7 @@ if __name__ == "__main__":
     Timer.setup(active=args.timing)
     fig_plt.default_mode = "image" if args.saveplt else "none"
 
+    # 定义每帧完成后的回调
     def onFrameFinished(frame: StereoFrame, system: MACVO, pb: ColoredTqdm):
         VisualizeRerunCallback(frame, system, pb)
         VisualizeVRAMUsage(frame, system, pb)
@@ -131,7 +139,7 @@ if __name__ == "__main__":
     # Initialize data source
     sequence = smart_transform(
         SequenceBase[StereoFrame].instantiate(datacfg.type, datacfg.args).clip(args.seq_from, args.seq_to),
-        cfg.Preprocess
+        cfg.Preprocess  # 应用配置中定义的预处理步骤
     )
     
     if args.preload:

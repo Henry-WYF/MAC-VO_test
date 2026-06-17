@@ -5,6 +5,7 @@ from .OutlierFilter import IObservationFilter
 from .MapProcessor import IMapProcessor
 from .KeyframeSelector import IKeyframeSelector
 from .Optimization import IOptimizer
+from .Optimization import GlobalPoseGraphOptimizer
 
 from .Frontend.StereoDepth import IStereoDepth
 from .Frontend.Matching    import IMatcher

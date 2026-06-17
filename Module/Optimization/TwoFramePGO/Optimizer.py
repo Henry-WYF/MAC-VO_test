@@ -21,9 +21,24 @@ from .Graphs import Analytic_ICP_TwoframePGO, Analytic_Reproj_TwoFramePGO, Analy
 
 
 class TwoFrame_PGO(IOptimizer[GraphInput, dict, GraphOutput]):
+    """
+    MAC-VO 的双帧位姿图优化器（Two-frame Pose Graph Optimizer）。
+
+    从全局 VisualMap 中提取当前帧及其关联的观测和地图点，构造因子图
+    并通过 Levenberg-Marquardt 算法优化当前帧的位姿。
+
+    工作流程：
+      1. get_graph_data(): 从 VisualMap 提取当前帧的观测、地图点、初始位姿
+      2. init_context():  根据 config 选择图类型（ICP/Reproj/Disparity × Autodiff/Analytic）
+      3. _optimize():     运行 LM 优化，以 Σ⁻¹ 作为信息矩阵加权
+      4. write_graph_data(): 将优化后的位姿写回 VisualMap
+
+    支持顺序模式（主线程阻塞）和并行模式（子进程异步优化）。
+    """
     @torch.no_grad()
     def get_graph_data(self, global_map: VisualMap, frame_idx: torch.Tensor,
                        observations: torch.Tensor | None = None, edges: torch.Tensor | None = None) -> GraphInput:
+        """从 VisualMap 中提取当前帧的图数据：观测、地图点、内参、初始位姿"""
         frame2opt = global_map.frames[frame_idx]
 
         obs = global_map.get_frame2match(frame2opt)
@@ -49,6 +64,10 @@ class TwoFrame_PGO(IOptimizer[GraphInput, dict, GraphOutput]):
 
     @staticmethod
     def init_context(config) -> dict:
+        """根据 config 分派到 6 种因子图类型之一（ICP/Reproj/Disparity × Autodiff/Analytic）。
+
+        配置 LM 优化器组件：Huber 核函数、PINV 求解器、TrustRegion 策略、FastTriggs 修正器。
+        """
         match (config.autodiff, config.graph_type):
             case (True, "icp"):
                 PoseGraphClass = ICP_TwoframePGO
@@ -80,6 +99,14 @@ class TwoFrame_PGO(IOptimizer[GraphInput, dict, GraphOutput]):
 
     @staticmethod
     def _optimize(context: dict, graph_data: GraphInput) -> tuple[dict, GraphOutput]:
+        """执行 Levenberg-Marquardt 优化。
+
+        关键步骤：
+        1. 根据 context 构建对应的因子图（ICP/Reproj/Disparity）
+        2. 构造信息矩阵 weight = block_diag(Σ₁⁻¹, Σ₂⁻¹, ...)
+           每个观测的残差用其协方差的逆加权 → 不确定的观测自动降权
+        3. LM 迭代优化，StopOnPlateau 提前终止
+        """
         with Timer.CPUTimingContext("TwoframePGO"), Timer.GPUTimingContext("TwoframePGO", torch.cuda.current_stream()):
             graph: FactorGraph = context["pose_graph_class"](graph_data)\
                 .to(device=torch.device(context["device"]), dtype=torch.double)
@@ -93,6 +120,7 @@ class TwoFrame_PGO(IOptimizer[GraphInput, dict, GraphOutput]):
             scheduler = StopOnPlateau(optimizer, steps=10, patience=2, decreasing=1e-5, verbose=False)
 
             while scheduler.continual():
+                # MAC-VO 核心：用协方差的逆作为信息矩阵 → metrics-aware 加权
                 weight = torch.block_diag(*(
                     torch.pinverse(graph.covariance_array().to(context["device"]).double())
                 ))

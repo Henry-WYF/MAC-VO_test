@@ -20,6 +20,7 @@ class IKeyframeSelector(ABC, T.Generic[T_Data], ConfigTestableSubclass):
 
 
 class AllKeyframe(IKeyframeSelector[StereoFrame]):
+    """每帧都是关键帧——不跳帧，精度最高但计算量最大"""
     def isKeyframe(self, frame: StereoFrame) -> bool:
         return True
 
@@ -28,7 +29,8 @@ class AllKeyframe(IKeyframeSelector[StereoFrame]):
         cls._enforce_config_spec(config, {})
 
 
-class UniformKeyframe(IKeyframeSelector[StereoFrame]):    
+class UniformKeyframe(IKeyframeSelector[StereoFrame]):
+    """均匀关键帧选择：每 keyframe_freq 帧选一帧作为关键帧，其余帧位姿由插值生成"""
     def isKeyframe(self, frame: StereoFrame) -> bool:
         return (frame.frame_idx % self.config.keyframe_freq) == 0
 

@@ -11,6 +11,15 @@ from pypose.optim.optimizer import _Optimizer, Trivial, RobustModel
 
 
 class FactorGraph(nn.Module, ABC):
+    """
+    因子图的抽象基类，封装了优化问题的前向传播和协方差提取。
+
+    所有具体的 PGO 图类型（ICP/Reproj/Disparity）都继承此类，
+    必须实现两个方法：
+      - forward():   计算残差向量 R
+      - covariance_array(): 返回每个残差对应的协方差矩阵（用于构建信息矩阵 Σ⁻¹）
+      - write_back(): 将优化后的参数写回外部数据结构
+    """
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
 
@@ -22,6 +31,15 @@ class FactorGraph(nn.Module, ABC):
 
 
 class AnalyticModule(nn.Module, ABC):
+    """
+    支持解析雅可比（Analytic Jacobian）的模块基类。
+
+    与使用 PyTorch autograd 自动求导不同，继承此类的模块需要手动实现
+    build_jacobian() 方法，提供解析推导的雅可比矩阵。在 MAC-VO 中，
+    这用于 ICP/Reproj/Disparity 三种因子的高效 LM 优化。
+
+    设置 verify=True 可自动校验解析雅可比与 autograd 结果的一致性。
+    """
     verify: bool = False
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -134,6 +152,13 @@ class LM_autograd(_Optimizer):
 
 
 class LM_analytic(_Optimizer):
+    """
+    使用解析雅可比的 Levenberg-Marquardt 优化器。
+
+    与 LM_autograd 的区别：不调用 modjac() 进行自动求导，而是直接
+    使用 AnalyticModule.build_jacobian() 获取雅可比矩阵，避免了
+    计算图的构建和反向传播开销，适合在推理阶段进行快速优化。
+    """
     def __init__(self, model: AnalyticModule, solver=None, strategy=None, kernel=None, corrector=None, \
                        weight=None, reject=16, min=1e-6, max=1e32, vectorize=True):
         assert min > 0, ValueError("min value has to be positive: {}".format(min))
