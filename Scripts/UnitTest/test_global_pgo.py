@@ -5,6 +5,7 @@ import torch
 
 pp = pytest.importorskip("pypose")
 
+from Module.Map import VisualMap
 from Module.Optimization.GlobalPGO import GlobalPoseGraphOptimizer, relative_pose
 
 
@@ -18,7 +19,7 @@ class FakeFrames:
         return int(self.data["pose"].size(0))
 
 
-class FakeMap:
+class FakeMap(VisualMap):
     def __init__(self, poses: torch.Tensor, need_interp: torch.Tensor | None = None) -> None:
         self.frames = FakeFrames(poses, need_interp)
 
