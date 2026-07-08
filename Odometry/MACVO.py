@@ -39,6 +39,7 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
         kf_selector     : Module.IKeyframeSelector[T_SensorFrame],
         optimizer       : Module.IOptimizer,
         global_pgo      : Module.GlobalPoseGraphOptimizer | None = None,
+        loop_closure    : Module.LoopClosureManager | None = None,
         **_excessive_args,
     ) -> None:
         super().__init__(profile=profile)
@@ -61,6 +62,7 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
         self.KeyframeSelector = kf_selector
         self.Optimizer = optimizer
         self.GlobalPGO = global_pgo
+        self.LoopClosure = loop_closure
         # end
 
         self.min_num_point = 10
@@ -98,6 +100,8 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
             if global_pgo_cfg is not None and bool(getattr(global_pgo_cfg, "enabled", False))
             else None
         )
+        loop_closure_cfg    = getattr(odomcfg, "loop_closure", None)
+        LoopClosure         = Module.LoopClosureManager(loop_closure_cfg) if loop_closure_cfg is not None else None
         
         return cls(
             frontend=Frontend,
@@ -110,6 +114,7 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
             kf_selector=KeyframeSelector,
             optimizer=Optimizer,
             global_pgo=GlobalPGO,
+            loop_closure=LoopClosure,
             **vars(odomcfg.args),
         )
     
@@ -137,6 +142,7 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
                     f"OutlierFilter   -'{self.OutlierFilter   .__class__.__name__}'",
                     f"MapRefiner      -'{self.MapRefiner      .__class__.__name__}'",
                     f"GlobalPGO       -'{self.GlobalPGO.__class__.__name__ if self.GlobalPGO is not None else 'disabled'}'",
+                    f"LoopClosure     -'{self.LoopClosure.__class__.__name__ if self.LoopClosure is not None and self.LoopClosure.enabled else 'disabled'}'",
                 ]
             ),
             title="Odometry Modules",
@@ -157,6 +163,8 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
         Module.IOptimizer.is_valid_config(config.optimizer)
         if hasattr(config, "global_pgo"):
             Module.GlobalPoseGraphOptimizer.is_valid_config(config.global_pgo)
+        if hasattr(config, "loop_closure"):
+            Module.LoopClosureManager.is_valid_config(config.loop_closure)
         
         cls._enforce_config_spec(config.args, {
             "device"            : lambda s: isinstance(s, str) and (("cuda" in s) or (s == "cpu")),
@@ -182,6 +190,23 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
         }))
         self.OutlierFilter.set_meta(frame0.stereo)
         self.prev_keyframe = (frame0, int(frame_idx.item()), depth0)
+        self._register_loop_frame(frame0, int(frame_idx.item()), depth0)
+
+    def receive_frames(self, sequence, saveto, on_frame_finished=None):
+        if self.LoopClosure is not None and self.LoopClosure.enabled:
+            self.LoopClosure.set_output_dir(saveto.path("loop_closure"))
+        return super().receive_frames(sequence, saveto, on_frame_finished)
+
+    def _register_loop_frame(
+        self,
+        frame: T_SensorFrame,
+        visual_map_idx: int,
+        depth: Module.IStereoDepth.Output,
+    ) -> None:
+        if self.LoopClosure is None or not self.LoopClosure.enabled:
+            return
+        pose = self.graph.frames.data["pose"][visual_map_idx]
+        self.LoopClosure.register_loop_frame(frame, depth, visual_map_idx, pose)
 
     def run_pair(self, frame0: T_SensorFrame, frame1: T_SensorFrame) -> None:
         """
@@ -338,6 +363,7 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
             self.Optimizer.start_optimize(
                 self.Optimizer.get_graph_data(self.graph, frame_idx)
             )
+            self._register_loop_frame(frame1, int(frame_idx.item()), depth1)
         
         # Add (dense) mapping points to the map #########################################
         if self.mapping:
@@ -406,6 +432,11 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
         if self.prev_keyframe is not None:
             self.Optimizer.write_map(self.graph)
         self.Optimizer.terminate()
+        if self.LoopClosure is not None and self.LoopClosure.enabled:
+            try:
+                self.LoopClosure.detect_all()
+            except Exception as error:
+                Logger.write("error", f"Loop-closure retrieval failed; VO result is preserved: {error}")
         if self.GlobalPGO is not None and self.GlobalPGO.optimize_on_terminate:
             self.GlobalPGO.run_on_terminate(self.graph)
         self.MapRefiner.elaborate_map(self.graph.frames)

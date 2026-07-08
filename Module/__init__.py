@@ -6,6 +6,7 @@ from .MapProcessor import IMapProcessor
 from .KeyframeSelector import IKeyframeSelector
 from .Optimization import IOptimizer
 from .Optimization import GlobalPoseGraphOptimizer
+from .LoopClosure import LoopClosureManager
 
 from .Frontend.StereoDepth import IStereoDepth
 from .Frontend.Matching    import IMatcher
