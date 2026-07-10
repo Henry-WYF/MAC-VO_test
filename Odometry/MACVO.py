@@ -63,6 +63,8 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
         self.Optimizer = optimizer
         self.GlobalPGO = global_pgo
         self.LoopClosure = loop_closure
+        if self.LoopClosure is not None:
+            self.LoopClosure.set_frontend(self.Frontend)
         # end
 
         self.min_num_point = 10
@@ -434,9 +436,10 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
         self.Optimizer.terminate()
         if self.LoopClosure is not None and self.LoopClosure.enabled:
             try:
-                self.LoopClosure.detect_all()
+                loop_queries = self.LoopClosure.detect_all()
+                self.LoopClosure.verify_candidates(self.graph, loop_queries)
             except Exception as error:
-                Logger.write("error", f"Loop-closure retrieval failed; VO result is preserved: {error}")
+                Logger.write("error", f"Loop-closure processing failed; VO result is preserved: {error}")
         if self.GlobalPGO is not None and self.GlobalPGO.optimize_on_terminate:
             self.GlobalPGO.run_on_terminate(self.graph)
         self.MapRefiner.elaborate_map(self.graph.frames)

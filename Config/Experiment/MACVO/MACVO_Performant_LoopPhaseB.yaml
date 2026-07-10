@@ -2,7 +2,7 @@ Common:
   device: &device cuda
 
 Odometry:
-  name: MACVO-Performant-LoopPhaseA
+  name: MACVO-Performant-LoopPhaseB
   args:
     device: *device
     edgewidth: 32
@@ -83,6 +83,38 @@ Odometry:
     orb_nlevels: 8
     top_k: 10
 
+    geometric_verification:
+      enabled: true
+      max_candidates_to_verify: 10
+      min_sensor_gap: 100
+
+    geometry:
+      min_points: 80
+      max_points: 800
+      max_depth: 20.0
+      max_depth_cov: 0.05
+      max_flow_cov: 1.0
+      border: 8
+      grid_rows: 8
+      grid_cols: 8
+      max_points_per_cell: 20
+
+    pnp:
+      reproj_error_px: 3.0
+      confidence: 0.999
+      iterations: 100
+      min_inliers: 50
+      min_inlier_ratio: 0.25
+      refine: true
+
+    verification:
+      max_mean_reproj_error_px: 3.0
+      max_rotation_diff_deg: 35.0
+      max_translation_diff_m: 8.0
+
+    loop_information:
+      trans_weight: 1.0
+      rot_weight: 1.0
 
 Data: !include ../../Sequence/TartanAir_example.yaml
 Preprocess: !include ../Common/Preprocess.yaml

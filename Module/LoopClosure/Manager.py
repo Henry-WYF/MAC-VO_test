@@ -10,12 +10,15 @@ from typing import Any
 import torch
 
 from DataLoader import StereoFrame
+from Module.Frontend.Frontend import IFrontend
 from Module.Frontend.StereoDepth import IStereoDepth
+from Module.Map import VisualMap
 from Utility.Extensions import ConfigTestable
 from Utility.PrettyPrint import Logger
 
 from .Recognizer import CausalBoWDatabase, ORBPlaceRecognizer
 from .Record import LoopFrameRecord
+from .Verification import LoopCandidateVerifier, LoopConstraint, has_required_pnp_functions
 
 
 class LoopClosureManager(ConfigTestable):
@@ -27,6 +30,8 @@ class LoopClosureManager(ConfigTestable):
         self.records: list[dict[str, Any]] = []
         self.last_registered_sensor_idx: int | None = None
         self.recognizer: ORBPlaceRecognizer | None = None
+        self.frontend: IFrontend | None = None
+        self.geometry_enabled = bool(getattr(getattr(config, "geometric_verification", None), "enabled", False))
         if self.enabled:
             try:
                 self.recognizer = ORBPlaceRecognizer(
@@ -41,7 +46,7 @@ class LoopClosureManager(ConfigTestable):
     @classmethod
     def is_valid_config(cls, config: SimpleNamespace | None) -> None:
         assert config is not None
-        cls._enforce_config_spec(config, {
+        base_spec = {
             "enabled": lambda value: isinstance(value, bool),
             "vocabulary_path": lambda value: isinstance(value, str),
             "keyframe_stride_sensor_frames": lambda value: isinstance(value, int) and value > 0,
@@ -51,7 +56,48 @@ class LoopClosureManager(ConfigTestable):
             "orb_scale_factor": lambda value: isinstance(value, (int, float)) and value > 1.0,
             "orb_nlevels": lambda value: isinstance(value, int) and value > 0,
             "top_k": lambda value: isinstance(value, int) and value > 0,
-        })
+        }
+        cls._enforce_config_spec(config, base_spec, allow_excessive_cfg=True)
+        excessive = set(vars(config)) - (set(base_spec) | {"geometric_verification", "geometry", "pnp", "verification", "loop_information"})
+        if excessive:
+            raise KeyError(f"Excessive Keys: {excessive} from {list(base_spec)}")
+        if hasattr(config, "geometric_verification"):
+            cls._enforce_config_spec(config.geometric_verification, {
+                "enabled": lambda value: isinstance(value, bool),
+                "max_candidates_to_verify": lambda value: isinstance(value, int) and value > 0,
+                "min_sensor_gap": lambda value: isinstance(value, int) and value >= 0,
+            })
+            cls._enforce_config_spec(config.geometry, {
+                "min_points": lambda value: isinstance(value, int) and value >= 4,
+                "max_points": lambda value: isinstance(value, int) and value > 0,
+                "max_depth": lambda value: isinstance(value, (int, float)) and value > 0.0,
+                "max_depth_cov": lambda value: isinstance(value, (int, float)) and value >= 0.0,
+                "max_flow_cov": lambda value: isinstance(value, (int, float)) and value >= 0.0,
+                "border": lambda value: isinstance(value, int) and value >= 0,
+                "grid_rows": lambda value: isinstance(value, int) and value > 0,
+                "grid_cols": lambda value: isinstance(value, int) and value > 0,
+                "max_points_per_cell": lambda value: isinstance(value, int) and value > 0,
+            })
+            cls._enforce_config_spec(config.pnp, {
+                "reproj_error_px": lambda value: isinstance(value, (int, float)) and value > 0.0,
+                "confidence": lambda value: isinstance(value, (int, float)) and 0.0 < value < 1.0,
+                "iterations": lambda value: isinstance(value, int) and value > 0,
+                "min_inliers": lambda value: isinstance(value, int) and value >= 4,
+                "min_inlier_ratio": lambda value: isinstance(value, (int, float)) and 0.0 <= value <= 1.0,
+                "refine": lambda value: isinstance(value, bool),
+            })
+            cls._enforce_config_spec(config.verification, {
+                "max_mean_reproj_error_px": lambda value: isinstance(value, (int, float)) and value > 0.0,
+                "max_rotation_diff_deg": lambda value: isinstance(value, (int, float)) and value >= 0.0,
+                "max_translation_diff_m": lambda value: isinstance(value, (int, float)) and value >= 0.0,
+            })
+            cls._enforce_config_spec(config.loop_information, {
+                "trans_weight": lambda value: isinstance(value, (int, float)) and value > 0.0,
+                "rot_weight": lambda value: isinstance(value, (int, float)) and value > 0.0,
+            })
+
+    def set_frontend(self, frontend: IFrontend) -> None:
+        self.frontend = frontend
 
     def set_output_dir(self, output_dir: Path) -> None:
         if not self.enabled:
@@ -156,3 +202,56 @@ class LoopClosureManager(ConfigTestable):
                 "top_k": int(self.config.top_k), "queries": queries,
             }, file, indent=2)
         return queries
+
+
+    def _record_by_loop_idx(self) -> dict[int, dict[str, Any]]:
+        return {int(record["loop_frame_idx"]): record for record in self.records}
+
+    def verify_candidates(self, global_map: VisualMap, queries: list[dict[str, Any]]) -> list[LoopConstraint]:
+        if not self.enabled or not self.geometry_enabled:
+            return []
+        if self.output_dir is None:
+            Logger.write("warn", "Skip loop geometric verification because output directory is unavailable.")
+            return []
+        if self.frontend is None:
+            Logger.write("error", "Skip loop geometric verification because Frontend was not injected.")
+            return []
+        if not has_required_pnp_functions():
+            Logger.write("error", "Skip loop geometric verification because OpenCV PnP/calib3d functions are unavailable.")
+            return []
+
+        record_metadata = self._record_by_loop_idx()
+        verifier = LoopCandidateVerifier(self.config, self.frontend)
+        verification_rows: list[dict[str, Any]] = []
+        constraints: list[LoopConstraint] = []
+        max_candidates = int(self.config.geometric_verification.max_candidates_to_verify)
+
+        for query in queries:
+            current_meta = record_metadata.get(int(query["loop_frame_idx"]))
+            if current_meta is None:
+                continue
+            current = LoopFrameRecord.load(self.output_dir / current_meta["file"])
+            for candidate in query.get("candidates", [])[:max_candidates]:
+                historical_meta = record_metadata.get(int(candidate["loop_frame_idx"]))
+                if historical_meta is None:
+                    continue
+                historical = LoopFrameRecord.load(self.output_dir / historical_meta["file"])
+                verification, constraint = verifier.verify(global_map, query, candidate, current, historical)
+                verification_rows.append(verification.to_dict())
+                if constraint is not None:
+                    constraints.append(constraint)
+
+        with open(self.output_dir / "loop_verification.json", "w", encoding="utf-8") as file:
+            json.dump({
+                "schema_version": 1,
+                "max_candidates_to_verify": max_candidates,
+                "verifications": verification_rows,
+            }, file, indent=2)
+        with open(self.output_dir / "loop_constraints.json", "w", encoding="utf-8") as file:
+            json.dump({
+                "schema_version": 1,
+                "pose_direction": "relative_pose = T_candidate_current = inverse(T_current_candidate)",
+                "constraints": [constraint.to_dict() for constraint in constraints],
+            }, file, indent=2)
+        Logger.write("info", f"Loop geometric verification accepted {len(constraints)} / {len(verification_rows)} candidates.")
+        return constraints

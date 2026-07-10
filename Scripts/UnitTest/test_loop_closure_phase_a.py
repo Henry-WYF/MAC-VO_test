@@ -11,6 +11,7 @@ import torch
 from DataLoader import StereoData, StereoFrame
 from Module.Frontend.StereoDepth import IStereoDepth
 from Module.LoopClosure import BinaryVocabulary, CausalBoWDatabase, LoopClosureManager, LoopFrameRecord, ORBPlaceRecognizer
+from Module.Optimization.GlobalPGO import PoseGraphEdge, compute_edge_residual, make_information, relative_pose
 
 
 def make_stereo(sensor_idx: int, height: int = 96, width: int = 128) -> StereoFrame:
@@ -109,3 +110,18 @@ def test_manager_registration_stride_and_cache_failure_policy(tmp_path: Path) ->
     assert not failing.register_loop_frame(make_stereo(0), make_depth(), 0, pose)
     assert not failing.enabled
     assert "cache failure" in str(failing.disabled_reason)
+
+
+def test_loop_constraint_relative_pose_direction_matches_global_pgo() -> None:
+    src = pp.SE3(torch.tensor([1.0, -0.5, 0.2, 0.0, 0.0, 0.258819, 0.965926]))
+    dst = pp.SE3(torch.tensor([-0.3, 2.0, 1.1, 0.0, 0.573576, 0.0, 0.819152]))
+    poses = torch.stack([src.tensor(), dst.tensor()], dim=0)
+    information = make_information(1.0, 1.0, dtype=torch.float64)
+
+    edge_relative = relative_pose(src, dst)
+    edge = PoseGraphEdge(0, 1, edge_relative, information, "loop")
+    assert torch.linalg.vector_norm(compute_edge_residual(edge, poses)).item() < 1e-6
+
+    pnp_direction = edge_relative.Inv()
+    wrong_edge = PoseGraphEdge(0, 1, pnp_direction, information, "loop")
+    assert torch.linalg.vector_norm(compute_edge_residual(wrong_edge, poses)).item() > 1e-3
