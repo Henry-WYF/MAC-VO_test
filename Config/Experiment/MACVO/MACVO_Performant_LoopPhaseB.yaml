@@ -89,11 +89,11 @@ Odometry:
       min_sensor_gap: 100
 
     geometry:
-      min_points: 80
+      min_points: 30
       max_points: 800
       max_depth: 20.0
       max_depth_cov: 0.05
-      max_flow_cov: 1.0
+      max_flow_cov: 100.0
       border: 8
       grid_rows: 8
       grid_cols: 8
@@ -103,7 +103,7 @@ Odometry:
       reproj_error_px: 3.0
       confidence: 0.999
       iterations: 100
-      min_inliers: 50
+      min_inliers: 20
       min_inlier_ratio: 0.25
       refine: true
 
