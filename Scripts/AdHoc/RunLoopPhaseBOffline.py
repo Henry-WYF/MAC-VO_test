@@ -380,6 +380,10 @@ def main() -> None:
 
     index_payload = _load_json(index_path)
     queries_payload = _load_json(queries_path)
+    if int(index_payload.get("schema_version", -1)) != 1:
+        raise ValueError("unsupported loop index schema")
+    if int(queries_payload.get("schema_version", -1)) not in {1, 2}:
+        raise ValueError("unsupported Phase A queries schema")
     records = index_payload.get("records")
     queries = queries_payload.get("queries")
     if not isinstance(records, list) or not isinstance(queries, list):

@@ -439,6 +439,7 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
                 loop_queries = self.LoopClosure.detect_all()
                 self.LoopClosure.verify_candidates(self.graph, loop_queries)
             except Exception as error:
+                self.LoopClosure.disable_geometry(f"Phase B exception: {error}")
                 Logger.write("error", f"Loop-closure processing failed; VO result is preserved: {error}")
         if self.GlobalPGO is not None and self.GlobalPGO.optimize_on_terminate:
             self.GlobalPGO.run_on_terminate(self.graph)

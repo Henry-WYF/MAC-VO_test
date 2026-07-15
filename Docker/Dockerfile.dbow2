@@ -1,0 +1,36 @@
+# Incremental DBoW2 image for a server that already has a working MAC-VO image.
+# Example:
+#   docker tag macvo:latest macvo:pre-dbow2
+#   docker build --build-arg MACVO_BASE_IMAGE=macvo:pre-dbow2 \
+#     -t macvo:phase-a-dbow2 -f Docker/Dockerfile.dbow2 .
+ARG MACVO_BASE_IMAGE=macvo:pre-dbow2
+FROM ${MACVO_BASE_IMAGE}
+
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       build-essential cmake python3-dev pybind11-dev libboost-serialization-dev \
+       libopencv-dev python3-opencv \
+    && rm -rf /var/lib/apt/lists/*
+
+# The original MAC-VO image used the pip OpenCV wheel.  Remove it before the
+# C++ extension is loaded so Python and DBoW2 resolve the same system OpenCV.
+RUN python3 -m pip uninstall -y opencv-python opencv-python-headless opencv-contrib-python || true
+
+COPY Thirdparty/DBoW2 /tmp/macvo-dbow2
+RUN cmake -S /tmp/macvo-dbow2 -B /tmp/macvo-dbow2-build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_LIBRARY_OUTPUT_DIRECTORY=/opt/macvo-native \
+    && cmake --build /tmp/macvo-dbow2-build --parallel \
+    && mkdir -p /usr/share/doc/macvo-dbow2 \
+    && cp /tmp/macvo-dbow2/LICENSE.txt /tmp/macvo-dbow2/NOTICE.md \
+          /tmp/macvo-dbow2/README.ORB_SLAM3.txt /usr/share/doc/macvo-dbow2/ \
+    && rm -rf /tmp/macvo-dbow2-build /tmp/macvo-dbow2
+
+ENV PYTHONPATH="/opt/macvo-native:${PYTHONPATH}"
+RUN python3 -c "import cv2, macvo_dbow2; print(cv2.__file__); print(macvo_dbow2.__file__)"
+RUN ! python3 -m pip list --format=freeze | grep -Eqi '^opencv-(python|python-headless|contrib-python)='
+
+ARG USERNAME=macvo
+USER ${USERNAME}
+CMD /bin/bash

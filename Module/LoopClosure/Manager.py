@@ -20,7 +20,14 @@ from Module.Map import VisualMap
 from Utility.Extensions import ConfigTestable
 from Utility.PrettyPrint import Logger
 
-from .Recognizer import CausalBoWDatabase, ORBPlaceRecognizer
+from .Recognizer import (
+    CausalRetrievalController,
+    CustomBinaryBackend,
+    DBoW2ORBBackend,
+    FrameIdentity,
+    ORBFeatureExtractor,
+    PlaceRecognitionBackend,
+)
 from .Record import LoopFrameRecord
 from .Verification import LoopCandidateVerifier, LoopConstraint, has_required_pnp_functions
 
@@ -69,23 +76,25 @@ class LoopClosureManager(ConfigTestable):
     def __init__(self, config: SimpleNamespace) -> None:
         self.config = config
         self.enabled = bool(config.enabled)
+        self.cache_enabled = bool(config.enabled)
+        self.retrieval_enabled = bool(config.enabled)
         self.disabled_reason: str | None = None
         self.output_dir: Path | None = None
         self.records: list[dict[str, Any]] = []
         self.last_registered_sensor_idx: int | None = None
-        self.recognizer: ORBPlaceRecognizer | None = None
+        self.extractor: ORBFeatureExtractor | None = None
         self.frontend: IFrontend | None = None
-        self.geometry_enabled = bool(getattr(getattr(config, "geometric_verification", None), "enabled", False))
+        self.geometry_enabled = bool(
+            config.enabled
+            and getattr(getattr(config, "geometric_verification", None), "enabled", False)
+        )
         if self.enabled:
             try:
-                self.recognizer = ORBPlaceRecognizer(
-                    config.vocabulary_path, config.orb_nfeatures,
-                    config.orb_scale_factor, config.orb_nlevels,
+                self.extractor = ORBFeatureExtractor(
+                    config.orb_nfeatures, config.orb_scale_factor, config.orb_nlevels,
                 )
-                if self.recognizer.vocabulary is None:
-                    Logger.write("warn", f"Loop vocabulary '{config.vocabulary_path}' is missing. Frames will be cached, but BoW query is disabled.")
             except Exception as error:
-                self._disable(f"Failed to initialize ORB place recognizer: {error}")
+                self._disable_all(f"Failed to initialize ORB feature extractor: {error}")
 
     @classmethod
     def is_valid_config(cls, config: SimpleNamespace | None) -> None:
@@ -102,7 +111,19 @@ class LoopClosureManager(ConfigTestable):
             "top_k": lambda value: _is_int(value, lambda item: item > 0),
         }
         cls._enforce_config_spec(config, base_spec, allow_excessive_cfg=True)
-        excessive = set(vars(config)) - (set(base_spec) | {"geometric_verification", "geometry", "pnp", "verification", "loop_information"})
+        optional_base = {
+            "recognizer_type": lambda value: value in {"custom_binary", "dbow2_orb"},
+            "bow_min_score": lambda value: value is None or _is_number(
+                value, lambda item: math.isfinite(float(item)) and 0.0 <= float(item) <= 1.0
+            ),
+        }
+        for key, predicate in optional_base.items():
+            if hasattr(config, key) and not predicate(getattr(config, key)):
+                raise ValueError(f"Config does not match specification! ({key}={getattr(config, key)!r})")
+        excessive = set(vars(config)) - (
+            set(base_spec) | set(optional_base)
+            | {"geometric_verification", "geometry", "pnp", "verification", "loop_information"}
+        )
         if excessive:
             raise KeyError(f"Excessive Keys: {excessive} from {list(base_spec)}")
         if hasattr(config, "geometric_verification"):
@@ -164,7 +185,7 @@ class LoopClosureManager(ConfigTestable):
         return bool(getattr(config.geometric_verification, "compare_flow_cov_gate", False))
 
     def set_output_dir(self, output_dir: Path) -> None:
-        if not self.enabled:
+        if not self.cache_enabled:
             return
         try:
             self.output_dir = Path(output_dir)
@@ -173,15 +194,29 @@ class LoopClosureManager(ConfigTestable):
             self.output_dir = None
             self._handle_cache_failure(error)
 
-    def _disable(self, reason: str) -> None:
+    def _disable_all(self, reason: str) -> None:
         self.enabled = False
+        self.cache_enabled = False
+        self.retrieval_enabled = False
+        self.geometry_enabled = False
         self.disabled_reason = reason
         Logger.write("error", f"Loop closure disabled: {reason}")
+
+    def _disable_retrieval(self, reason: str) -> None:
+        self.retrieval_enabled = False
+        self.geometry_enabled = False
+        self.disabled_reason = reason
+        Logger.write("error", f"Loop retrieval disabled; frame caching remains enabled: {reason}")
+
+    def disable_geometry(self, reason: str) -> None:
+        self.geometry_enabled = False
+        self.disabled_reason = reason
+        Logger.write("error", f"Loop geometric verification disabled: {reason}")
 
     def _handle_cache_failure(self, error: Exception) -> None:
         if self.config.cache_failure_policy == "raise":
             raise error
-        self._disable(f"cache failure: {error}")
+        self._disable_all(f"cache failure: {error}")
 
     def _write_index(self) -> None:
         assert self.output_dir is not None
@@ -196,7 +231,7 @@ class LoopClosureManager(ConfigTestable):
                 temporary.unlink()
 
     def should_register(self, sensor_frame_idx: int) -> bool:
-        if not self.enabled:
+        if not self.cache_enabled:
             return False
         if self.last_registered_sensor_idx is None:
             return True
@@ -208,11 +243,10 @@ class LoopClosureManager(ConfigTestable):
         if self.output_dir is None:
             self._handle_cache_failure(RuntimeError("loop cache output directory was not configured"))
             return False
-        assert self.recognizer is not None
+        assert self.extractor is not None
         try:
             retrieval_started = time.perf_counter()
-            keypoints, descriptors = self.recognizer.extract(frame.stereo.imageL)
-            bow = self.recognizer.make_bow(descriptors)
+            keypoints, descriptors = self.extractor.extract(frame.stereo.imageL)
             retrieval_build_ms = (time.perf_counter() - retrieval_started) * 1000.0
             loop_idx = len(self.records)
             record = LoopFrameRecord(
@@ -221,14 +255,15 @@ class LoopClosureManager(ConfigTestable):
                 image_left=frame.stereo.imageL, image_right=frame.stereo.imageR, intrinsic=frame.stereo.K,
                 baseline=frame.stereo.baseline, body_to_sensor=frame.stereo.T_BS.tensor(), depth=depth.depth,
                 depth_covariance=depth.cov, registered_pose=registered_pose, orb_keypoints=keypoints,
-                orb_descriptors=descriptors, bow_vector=bow,
+                orb_descriptors=descriptors, bow_vector=None,
             )
             relative_path = Path("frames", f"loop_{loop_idx:06d}_sensor_{frame.frame_idx:09d}.pt")
             record.save(self.output_dir / relative_path)
             self.records.append({
                 "sensor_frame_idx": int(frame.frame_idx), "visual_map_idx": int(visual_map_idx),
                 "loop_frame_idx": loop_idx, "file": relative_path.as_posix(),
-                "orb_features": int(len(descriptors)), "has_bow": bow is not None,
+                "orb_features": int(len(descriptors)), "has_bow": False,
+                "feature_extraction_time_ms": retrieval_build_ms,
                 "retrieval_build_time_ms": retrieval_build_ms,
             })
             self._write_index()
@@ -238,33 +273,105 @@ class LoopClosureManager(ConfigTestable):
             self._handle_cache_failure(error)
             return False
 
-    def detect_all(self) -> list[dict[str, Any]]:
-        if not self.enabled or self.output_dir is None or self.recognizer is None:
+    def _make_backend(self) -> PlaceRecognitionBackend:
+        recognizer_type = str(getattr(self.config, "recognizer_type", "custom_binary"))
+        if recognizer_type == "custom_binary":
+            return CustomBinaryBackend(
+                self.config.vocabulary_path,
+                self.config.orb_nfeatures,
+                self.config.orb_scale_factor,
+                self.config.orb_nlevels,
+            )
+        if recognizer_type == "dbow2_orb":
+            return DBoW2ORBBackend(self.config.vocabulary_path)
+        raise ValueError(f"Unsupported loop recognizer type: {recognizer_type}")
+
+    def detect_all(
+        self,
+        record_dir: Path | None = None,
+        output_dir: Path | None = None,
+    ) -> list[dict[str, Any]]:
+        if not self.retrieval_enabled or self.output_dir is None:
             return []
-        if self.recognizer.vocabulary is None:
-            Logger.write("warn", "Skip causal BoW query because no vocabulary was loaded.")
+        record_root = self.output_dir if record_dir is None else Path(record_dir)
+        result_root = self.output_dir if output_dir is None else Path(output_dir)
+        try:
+            result_root.mkdir(parents=True, exist_ok=True)
+        except Exception as error:
+            self._disable_retrieval(f"failed to prepare Phase A output directory: {error}")
             return []
-        database = CausalBoWDatabase(self.config.temporal_exclusion_sensor_frames)
+        try:
+            backend = self._make_backend()
+        except Exception as error:
+            self._disable_retrieval(f"failed to initialize place-recognition backend: {error}")
+            return []
+
+        controller = CausalRetrievalController(
+            backend,
+            self.config.temporal_exclusion_sensor_frames,
+            self.config.top_k,
+            getattr(self.config, "bow_min_score", None),
+        )
         queries: list[dict[str, Any]] = []
-        for metadata in sorted(self.records, key=lambda item: item["sensor_frame_idx"]):
-            record = LoopFrameRecord.load(self.output_dir / metadata["file"])
-            if record.bow_vector is None:
-                continue
-            candidates, elapsed_ms = database.query(record.sensor_frame_idx, record.bow_vector, self.config.top_k)
-            assert all(candidate.sensor_frame_idx < record.sensor_frame_idx for candidate in candidates)
-            queries.append({
-                "sensor_frame_idx": record.sensor_frame_idx, "visual_map_idx": record.visual_map_idx,
-                "loop_frame_idx": record.loop_frame_idx, "orb_features": int(len(record.orb_descriptors)),
-                "retrieval_build_time_ms": float(metadata.get("retrieval_build_time_ms", 0.0)),
-                "query_time_ms": elapsed_ms, "candidates": [candidate.__dict__ for candidate in candidates],
-            })
-            database.add(record.sensor_frame_idx, record.visual_map_idx, record.loop_frame_idx, record.bow_vector)
-        with open(self.output_dir / "queries.json", "w", encoding="utf-8") as file:
-            json.dump({
-                "schema_version": 1, "temporal_exclusion_unit": "sensor_frame_idx",
-                "temporal_exclusion": int(self.config.temporal_exclusion_sensor_frames),
-                "top_k": int(self.config.top_k), "queries": queries,
-            }, file, indent=2)
+        try:
+            for metadata in sorted(self.records, key=lambda item: item["sensor_frame_idx"]):
+                record = LoopFrameRecord.load(record_root / metadata["file"])
+                result = controller.query_then_enqueue(
+                    FrameIdentity(record.sensor_frame_idx, record.visual_map_idx, record.loop_frame_idx),
+                    record.orb_descriptors,
+                )
+                assert all(candidate.sensor_frame_idx < record.sensor_frame_idx for candidate in result.candidates)
+                queries.append({
+                    "sensor_frame_idx": record.sensor_frame_idx,
+                    "visual_map_idx": record.visual_map_idx,
+                    "loop_frame_idx": record.loop_frame_idx,
+                    "orb_features": int(len(record.orb_descriptors)),
+                    "feature_extraction_time_ms": float(metadata.get(
+                        "feature_extraction_time_ms", metadata.get("retrieval_build_time_ms", 0.0)
+                    )),
+                    "empty_descriptors": result.empty_descriptors,
+                    "eligible_database_entries": result.eligible_database_entries,
+                    "retrieved_before_score_filter": result.retrieved_before_score_filter,
+                    "after_score_filter": result.after_score_filter,
+                    "returned_candidates": len(result.candidates),
+                    "query_time_ms": result.query_time_ms,
+                    "candidates": [candidate.__dict__ for candidate in result.candidates],
+                })
+        except Exception as error:
+            self._disable_retrieval(f"Phase A query failed: {error}")
+            return []
+
+        try:
+            backend_metadata = backend.metadata()
+        except Exception as error:
+            self._disable_retrieval(f"failed to collect Phase A backend metadata: {error}")
+            return []
+        payload = {
+            "schema_version": 2,
+            "temporal_exclusion_unit": "sensor_frame_idx",
+            "temporal_exclusion": int(self.config.temporal_exclusion_sensor_frames),
+            "top_k": int(self.config.top_k),
+            "bow_min_score": getattr(self.config, "bow_min_score", None),
+            "recognizer": backend_metadata,
+            "summary": {
+                "query_count": len(queries),
+                "queries_with_candidates": sum(bool(query["candidates"]) for query in queries),
+                "returned_candidate_count": sum(len(query["candidates"]) for query in queries),
+            },
+            "queries": queries,
+        }
+        target = result_root / "queries.json"
+        temporary = target.with_suffix(".json.tmp")
+        try:
+            with open(temporary, "w", encoding="utf-8") as file:
+                json.dump(_json_safe(payload), file, indent=2, allow_nan=False)
+            os.replace(temporary, target)
+        except Exception as error:
+            self._disable_retrieval(f"failed to write Phase A output: {error}")
+            return []
+        finally:
+            if temporary.exists():
+                temporary.unlink()
         return queries
 
 
@@ -449,6 +556,9 @@ class LoopClosureManager(ConfigTestable):
         progress_interval: int | None = None,
     ) -> list[LoopConstraint]:
         if not self.enabled or not self.geometry_enabled:
+            return []
+        if not queries or not any(query.get("candidates") for query in queries):
+            Logger.write("info", "Skip loop geometric verification because Phase A returned no candidates.")
             return []
         if self.output_dir is None:
             Logger.write("warn", "Skip loop geometric verification because output directory is unavailable.")
