@@ -128,7 +128,11 @@ class LoopClosureManager(ConfigTestable):
                     "grid_cols": lambda value: _is_int(value, lambda item: item > 0),
                     "max_points_per_cell": lambda value: _is_int(value, lambda item: item > 0),
                 },
-                {"flow_cov_gate_enabled": lambda value: isinstance(value, bool)},
+                {
+                    "flow_cov_gate_enabled": lambda value: isinstance(value, bool),
+                    "flow_cov_adaptive_target_points": lambda value: value is None
+                    or _is_int(value, lambda item: item > 0),
+                },
             )
             _validate_section(config.pnp, {
                 "reproj_error_px": lambda value: _is_number(value, lambda item: item > 0.0),

@@ -5,6 +5,7 @@ import contextlib
 import hashlib
 import json
 import shutil
+import subprocess
 import time
 from pathlib import Path
 from typing import Any
@@ -13,7 +14,7 @@ import numpy as np
 import torch
 
 from Module.Frontend.Frontend import IFrontend
-from Module.LoopClosure import LoopClosureManager
+from Module.LoopClosure import LoopClosureManager, LoopFrameRecord
 from Module.Map import VisualMap
 from Utility.Config import load_config
 
@@ -24,6 +25,139 @@ def _sha256(path: Path) -> str:
         while chunk := file.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _git_commit(repo_root: Path) -> str | None:
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return completed.stdout.strip() or None
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be a positive integer")
+    return parsed
+
+
+def _pose_matrix(pose: np.ndarray | list[float]) -> np.ndarray:
+    values = np.asarray(pose, dtype=np.float64).reshape(7)
+    translation = values[:3]
+    x, y, z, w = values[3:]
+    norm = float(np.linalg.norm([x, y, z, w]))
+    if not np.isfinite(norm) or norm == 0.0:
+        raise ValueError("invalid pose quaternion")
+    x, y, z, w = np.asarray([x, y, z, w]) / norm
+    rotation = np.asarray(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ],
+        dtype=np.float64,
+    )
+    matrix = np.eye(4, dtype=np.float64)
+    matrix[:3, :3] = rotation
+    matrix[:3, 3] = translation
+    return matrix
+
+
+def evaluate_gt_pose_proxy(
+    constraints_path: Path,
+    ref_poses_path: Path,
+    record_dir: Path,
+    records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Evaluate accepted PnP poses using the experiment's frozen, offline-only proxy."""
+    definition = {
+        "relative_pose": "inverse(T_world_current) @ T_world_candidate",
+        "estimated_field": "pnp_relative_pose",
+        "long_span_min_sensor_frames": 300,
+        "accurate": "translation_error_m < 1 and rotation_error_deg < 5",
+        "large_error": "translation_error_m > 3 or rotation_error_deg > 15",
+        "remainder": "suspicious",
+        "interpretation": "offline pose-error proxy; not an image-overlap or precision label",
+    }
+    if not ref_poses_path.is_file():
+        return {"available": False, "reason": "ref_poses.npy missing", "definition": definition}
+    reference = np.load(ref_poses_path, allow_pickle=False)
+    if reference.ndim != 2 or reference.shape[1] != 8:
+        return {"available": False, "reason": "invalid ref_poses.npy shape", "definition": definition}
+    payload = _load_json(constraints_path)
+    constraints = payload.get("constraints")
+    if not isinstance(constraints, list):
+        raise ValueError(f"constraints list missing from {constraints_path}")
+    record_by_sensor = {int(row["sensor_frame_idx"]): row for row in records}
+    counts = {"accurate": 0, "suspicious": 0, "large_error": 0}
+    long_span_accurate = 0
+    excluded = 0
+    evaluated: list[dict[str, Any]] = []
+    for constraint in constraints:
+        candidate_idx = int(constraint["src_sensor_frame_idx"])
+        current_idx = int(constraint["dst_sensor_frame_idx"])
+        if not (0 <= candidate_idx < len(reference) and 0 <= current_idx < len(reference)):
+            excluded += 1
+            continue
+        candidate_record = record_by_sensor.get(candidate_idx)
+        current_record = record_by_sensor.get(current_idx)
+        if candidate_record is None or current_record is None:
+            excluded += 1
+            continue
+        try:
+            candidate_ns = LoopFrameRecord.load(record_dir / str(candidate_record["file"])).frame_ns
+            current_ns = LoopFrameRecord.load(record_dir / str(current_record["file"])).frame_ns
+        except (OSError, KeyError, ValueError, TypeError):
+            excluded += 1
+            continue
+        if int(reference[candidate_idx, 0]) != candidate_ns or int(reference[current_idx, 0]) != current_ns:
+            excluded += 1
+            continue
+        world_candidate = _pose_matrix(reference[candidate_idx, 1:])
+        world_current = _pose_matrix(reference[current_idx, 1:])
+        gt_relative = np.linalg.inv(world_current) @ world_candidate
+        estimated = _pose_matrix(constraint["pnp_relative_pose"])
+        error = np.linalg.inv(gt_relative) @ estimated
+        translation_error = float(np.linalg.norm(error[:3, 3]))
+        cosine = float(np.clip((np.trace(error[:3, :3]) - 1.0) / 2.0, -1.0, 1.0))
+        rotation_error = float(np.degrees(np.arccos(cosine)))
+        if translation_error < 1.0 and rotation_error < 5.0:
+            label = "accurate"
+        elif translation_error > 3.0 or rotation_error > 15.0:
+            label = "large_error"
+        else:
+            label = "suspicious"
+        counts[label] += 1
+        span = current_idx - candidate_idx
+        if label == "accurate" and span >= 300:
+            long_span_accurate += 1
+        evaluated.append(
+            {
+                "current_sensor_frame_idx": current_idx,
+                "candidate_sensor_frame_idx": candidate_idx,
+                "sensor_frame_span": span,
+                "translation_error_m": translation_error,
+                "rotation_error_deg": rotation_error,
+                "label": label,
+            }
+        )
+    return {
+        "available": True,
+        "definition": definition,
+        "accepted_constraints": len(constraints),
+        "evaluated_constraints": len(evaluated),
+        "excluded_unaligned_or_missing": excluded,
+        "counts": counts,
+        "long_span_accurate": long_span_accurate,
+        "rows": evaluated,
+    }
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -212,6 +346,11 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         help="Optional smoke-test limit; omit for the complete paired experiment.",
     )
+    parser.add_argument(
+        "--adaptive-target-points",
+        type=_positive_int,
+        help="Covariance-stage minimum for gate-on; omit to reproduce the fixed threshold gate.",
+    )
     return parser.parse_args()
 
 
@@ -233,6 +372,8 @@ def main() -> None:
     loop_config = config.Odometry.loop_closure
     frontend_config = config.Odometry.frontend
     loop_config.geometry.flow_cov_gate_enabled = args.primary_gate == "enabled"
+    # Explicitly override the YAML so an omitted CLI option always means the fixed baseline.
+    loop_config.geometry.flow_cov_adaptive_target_points = args.adaptive_target_points
     loop_config.geometric_verification.compare_flow_cov_gate = True
     frontend_config.args.device = args.device
     LoopClosureManager.is_valid_config(loop_config)
@@ -275,6 +416,20 @@ def main() -> None:
     if not torch.equal(global_map.frames.data["pose"].tensor, pose_before):
         raise RuntimeError("offline Phase B verification modified VisualMap poses")
     comparison_validation = validate_comparison_outputs(output_dir)
+    gt_pose_proxy = {
+        "gate_enabled": evaluate_gt_pose_proxy(
+            output_dir / "loop_constraints_gate_enabled.json",
+            result_dir / "ref_poses.npy",
+            record_dir,
+            records,
+        ),
+        "gate_disabled": evaluate_gt_pose_proxy(
+            output_dir / "loop_constraints_gate_disabled.json",
+            result_dir / "ref_poses.npy",
+            record_dir,
+            records,
+        ),
+    }
 
     output_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(index_path, output_dir / "source_index.json")
@@ -286,18 +441,34 @@ def main() -> None:
         "source_index_sha256": _sha256(index_path),
         "source_queries_sha256": _sha256(queries_path),
         "source_tensor_map_sha256": _sha256(map_path),
+        "code_commit": _git_commit(Path(__file__).resolve().parents[2]),
+        "code_source_sha256": {
+            "verification": _sha256(
+                Path(__file__).resolve().parents[2] / "Module/LoopClosure/Verification.py"
+            ),
+            "manager": _sha256(
+                Path(__file__).resolve().parents[2] / "Module/LoopClosure/Manager.py"
+            ),
+            "offline_runner": _sha256(Path(__file__).resolve()),
+            "config": _sha256(config_path),
+        },
         "device": args.device,
         "configured_frontend_type": configured_frontend_type,
         "runtime_frontend_type": runtime_frontend_type,
         "nvtx_disabled_for_cpu": nvtx_disabled_for_cpu,
         "primary_gate_enabled": loop_config.geometry.flow_cov_gate_enabled,
         "comparison_enabled": True,
+        "gate_enabled_selection_mode": (
+            "fixed" if args.adaptive_target_points is None else "adaptive"
+        ),
+        "adaptive_target_points": args.adaptive_target_points,
         "max_total_candidates": args.max_total_candidates,
         "selected_candidates": selected_candidates,
         "elapsed_seconds": elapsed_seconds,
         "primary_constraints": len(constraints),
         "pose_invariant": True,
         "comparison_validation": comparison_validation,
+        "gt_pose_proxy": gt_pose_proxy,
     }
     temporary = output_dir / "offline_run_manifest.json.tmp"
     with open(temporary, "w", encoding="utf-8") as file:

@@ -162,6 +162,16 @@ def _correspondence_signature(indices: torch.Tensor) -> str:
     return hashlib.sha256(normalized.tobytes(order="C")).hexdigest()
 
 
+def _covariance_triplet_statistics(covariance: torch.Tensor) -> dict[str, Any]:
+    uu, vv = covariance[0], covariance[1]
+    risk = torch.maximum(uu, vv)
+    return {
+        "uu": covariance_statistics(uu),
+        "vv": covariance_statistics(vv),
+        "risk_max_uu_vv": covariance_statistics(risk),
+    }
+
+
 def _rotation_matrix_to_quaternion_xyzw(matrix: np.ndarray) -> np.ndarray:
     matrix = np.asarray(matrix, dtype=np.float64)
     trace = float(np.trace(matrix))
@@ -524,7 +534,11 @@ class LoopCandidateVerifier:
             "frontend_score_below_reference": int(reference_pass.sum().item()),
             "frontend_reference_kind": "sampled/no_dense_nms",
             "frontend_reference_operator": "strict_less_than",
+            "negative_uu_count": int((uu_finite & (uu < 0)).sum().item()),
+            "negative_vv_count": int((vv_finite & (vv < 0)).sum().item()),
         }
+        diagnostics["negative_uu_count"] = diagnostics["covariance"]["negative_uu_count"]
+        diagnostics["negative_vv_count"] = diagnostics["covariance"]["negative_vv_count"]
         for name, values in (("uu", uu), ("vv", vv), ("uv", uv), ("sampled_frontend_score", score)):
             finite = values[torch.isfinite(values)].detach().cpu().float()
             if finite.numel() > 0:
@@ -554,7 +568,100 @@ class LoopCandidateVerifier:
             "frontend_score_below_reference": 0,
             "frontend_reference_kind": "sampled/no_dense_nms",
             "frontend_reference_operator": "strict_less_than",
+            "negative_uu_count": 0,
+            "negative_vv_count": 0,
         }
+        diagnostics["negative_uu_count"] = 0
+        diagnostics["negative_vv_count"] = 0
+
+    def _covariance_selection(
+        self,
+        common: PreparedCommon,
+        gate_enabled: bool,
+        diagnostics: dict[str, Any],
+    ) -> torch.Tensor:
+        point_count = common.candidate_uv.size(0)
+        all_points = torch.ones(
+            point_count, dtype=torch.bool, device=common.candidate_uv.device
+        )
+        target = getattr(
+            getattr(self.config, "geometry", SimpleNamespace()),
+            "flow_cov_adaptive_target_points",
+            None,
+        )
+        adaptive = gate_enabled and target is not None
+        diagnostics.update(
+            {
+                "selection_mode": (
+                    "disabled" if not gate_enabled else "adaptive" if adaptive else "fixed"
+                ),
+                "fixed_core_points": None,
+                "adaptive_target_points": int(target) if adaptive else None,
+                "adaptive_pool_points": None,
+                "adaptive_added_points": None,
+                "adaptive_final_points_before_match_depth": None,
+                "adaptive_points_after_match_mask": None,
+                "adaptive_points_after_depth": None,
+                "adaptive_shortfall": None,
+                "adaptive_post_filter_shortfall": None,
+                "adaptive_effective_risk_cutoff": None,
+                "adaptive_added_risk_statistics": None,
+                "adaptive_final_risk_statistics": None,
+            }
+        )
+        if not gate_enabled:
+            diagnostics["gate_applied"] = False
+            diagnostics["gate_skip_reason"] = "disabled_by_config"
+            return all_points
+        if common.covariance is None:
+            diagnostics["gate_applied"] = False
+            diagnostics["gate_skip_reason"] = "covariance_unavailable"
+            return all_points
+
+        assert common.covariance_gate_mask is not None
+        core = common.covariance_gate_mask.clone()
+        core_count = int(core.sum().item())
+        diagnostics["gate_applied"] = True
+        diagnostics["gate_skip_reason"] = None
+        diagnostics["fixed_core_points"] = core_count
+        if target is None:
+            return core
+
+        target = int(target)
+        covariance = common.covariance
+        uu, vv = covariance[0], covariance[1]
+        joint_finite = torch.isfinite(uu) & torch.isfinite(vv)
+        pool = joint_finite & ~core
+        pool_indices = torch.nonzero(pool, as_tuple=False).squeeze(1)
+        diagnostics["adaptive_pool_points"] = int(pool_indices.numel())
+        need = max(target - core_count, 0)
+        added_indices = pool_indices[:0]
+        if need > 0 and pool_indices.numel() > 0:
+            risk_cpu = torch.maximum(uu[pool_indices], vv[pool_indices]).detach().cpu().float()
+            original_cpu = common.original_indices[pool_indices].detach().cpu().to(torch.int64)
+            # NumPy lexsort is deterministic: risk is primary, original sampling index breaks ties.
+            order = np.lexsort((original_cpu.numpy(), risk_cpu.numpy()))
+            take = torch.from_numpy(order[:need]).to(device=pool_indices.device, dtype=torch.long)
+            added_indices = pool_indices[take]
+            core[added_indices] = True
+
+        added_count = int(added_indices.numel())
+        final_count = int(core.sum().item())
+        diagnostics["adaptive_added_points"] = added_count
+        diagnostics["adaptive_final_points_before_match_depth"] = final_count
+        diagnostics["adaptive_shortfall"] = max(target - final_count, 0)
+        if added_count > 0:
+            added_covariance = covariance[:, added_indices]
+            diagnostics["adaptive_effective_risk_cutoff"] = float(
+                torch.maximum(added_covariance[0], added_covariance[1]).max().item()
+            )
+            diagnostics["adaptive_added_risk_statistics"] = _covariance_triplet_statistics(
+                added_covariance
+            )
+        diagnostics["adaptive_final_risk_statistics"] = _covariance_triplet_statistics(
+            covariance[:, core]
+        )
+        return core
 
     def _verify_branch(
         self,
@@ -568,29 +675,25 @@ class LoopCandidateVerifier:
         started: float,
     ) -> tuple[VerificationRecord, LoopConstraint | None]:
         diagnostics = copy.deepcopy(common.diagnostics)
-        mask = torch.ones(common.candidate_uv.size(0), dtype=torch.bool, device=common.candidate_uv.device)
-        if gate_enabled and common.covariance is not None:
-            assert common.covariance_gate_mask is not None
-            mask &= common.covariance_gate_mask
-            diagnostics["gate_applied"] = True
-            diagnostics["gate_skip_reason"] = None
-        else:
-            diagnostics["gate_applied"] = False
-            diagnostics["gate_skip_reason"] = (
-                "disabled_by_config" if not gate_enabled else "covariance_unavailable"
-            )
+        mask = self._covariance_selection(common, gate_enabled, diagnostics)
         diagnostics["gate_requested"] = gate_enabled
         diagnostics["after_flow_cov"] = int(mask.sum().item())
 
         if common.match_mask is not None:
             mask &= common.match_mask
         diagnostics["after_match_mask"] = int(mask.sum().item())
+        if diagnostics["selection_mode"] == "adaptive":
+            diagnostics["adaptive_points_after_match_mask"] = int(mask.sum().item())
 
         flow_count = int(mask.sum().item())
         diagnostics["flow_points"] = flow_count
         if flow_count == 0:
             diagnostics["valid_depth_after_flow_points"] = 0
             diagnostics["geometry_points"] = 0
+            if diagnostics["selection_mode"] == "adaptive":
+                target = int(diagnostics["adaptive_target_points"])
+                diagnostics["adaptive_points_after_depth"] = 0
+                diagnostics["adaptive_post_filter_shortfall"] = target
             diagnostics["pnp_correspondence_count"] = 0
             diagnostics["pnp_correspondence_signature"] = _correspondence_signature(
                 common.original_indices[:0]
@@ -614,6 +717,10 @@ class LoopCandidateVerifier:
         selected = selected[depth_mask]
         geometry_count = int(selected.numel())
         diagnostics["geometry_points"] = geometry_count
+        if diagnostics["selection_mode"] == "adaptive":
+            target = int(diagnostics["adaptive_target_points"])
+            diagnostics["adaptive_points_after_depth"] = geometry_count
+            diagnostics["adaptive_post_filter_shortfall"] = max(target - geometry_count, 0)
         original_indices = common.original_indices[selected]
         diagnostics["pnp_correspondence_count"] = geometry_count
         diagnostics["pnp_correspondence_signature"] = _correspondence_signature(original_indices)
@@ -657,6 +764,20 @@ class LoopCandidateVerifier:
         points_ned = pixel2point_NED(candidate_uv, depth, frame_K).float()
         points_cv = _tensor_to_numpy(points_ned.roll(shifts=-1, dims=-1).float())
         diagnostics["pnp_input_points"] = geometry_count
+        if common.covariance is not None:
+            selected_covariance = common.covariance[:, selected]
+            diagnostics["pnp_input_covariance_statistics"] = _covariance_triplet_statistics(
+                selected_covariance
+            )
+        else:
+            selected_covariance = None
+            diagnostics["pnp_input_covariance_statistics"] = None
+        diagnostics["pnp_inlier_covariance_statistics"] = None
+        diagnostics["pnp_outlier_covariance_statistics"] = None
+        diagnostics["pnp_inlier_original_index_count"] = None
+        diagnostics["pnp_inlier_original_index_signature"] = None
+        diagnostics["pnp_outlier_original_index_count"] = None
+        diagnostics["pnp_outlier_original_index_signature"] = None
 
         seed = self._pnp_seed(query, candidate)
         rng_applied = False
@@ -685,6 +806,25 @@ class LoopCandidateVerifier:
 
         T_current_candidate, mean_error, inliers = pnp
         inlier_count = int(len(inliers))
+        inlier_local = torch.as_tensor(inliers, device=selected.device, dtype=torch.long)
+        outlier_local_mask = torch.ones(geometry_count, dtype=torch.bool, device=selected.device)
+        outlier_local_mask[inlier_local] = False
+        outlier_local = torch.nonzero(outlier_local_mask, as_tuple=False).squeeze(1)
+        diagnostics["pnp_inlier_original_index_count"] = inlier_count
+        diagnostics["pnp_inlier_original_index_signature"] = _correspondence_signature(
+            original_indices[inlier_local]
+        )
+        diagnostics["pnp_outlier_original_index_count"] = int(outlier_local.numel())
+        diagnostics["pnp_outlier_original_index_signature"] = _correspondence_signature(
+            original_indices[outlier_local]
+        )
+        if selected_covariance is not None:
+            diagnostics["pnp_inlier_covariance_statistics"] = _covariance_triplet_statistics(
+                selected_covariance[:, inlier_local]
+            )
+            diagnostics["pnp_outlier_covariance_statistics"] = _covariance_triplet_statistics(
+                selected_covariance[:, outlier_local]
+            )
         inlier_ratio = inlier_count / max(geometry_count, 1)
         min_inliers = int(_get_config(self.config, "pnp", "min_inliers", 50))
         min_inlier_ratio = float(_get_config(self.config, "pnp", "min_inlier_ratio", 0.25))

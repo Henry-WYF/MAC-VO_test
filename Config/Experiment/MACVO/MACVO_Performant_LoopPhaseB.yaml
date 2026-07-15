@@ -95,6 +95,8 @@ Odometry:
       max_depth: 20.0
       max_depth_cov: 0.05
       flow_cov_gate_enabled: false
+      # Experimental Phase B target at the covariance stage; null preserves the fixed gate.
+      flow_cov_adaptive_target_points: 100
       max_flow_cov: 100.0
       border: 8
       grid_rows: 8

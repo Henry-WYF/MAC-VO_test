@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
 import pypose as pp
 import pytest
 import torch
@@ -19,10 +20,23 @@ from Module.LoopClosure.Verification import (
 )
 from Module.Map import VisualMap
 from Module.Map.Template import FrameNode
-from Scripts.AdHoc.RunLoopPhaseBOffline import limit_queries, validate_comparison_outputs
+from Scripts.AdHoc.RunLoopPhaseBOffline import (
+    evaluate_gt_pose_proxy,
+    limit_queries,
+    validate_comparison_outputs,
+)
 
 
-def make_config(tmp_path: Path, *, gate: bool | None = False, compare: bool | None = True) -> SimpleNamespace:
+_MISSING = object()
+
+
+def make_config(
+    tmp_path: Path,
+    *,
+    gate: bool | None = False,
+    compare: bool | None = True,
+    adaptive_target: int | None | object = _MISSING,
+) -> SimpleNamespace:
     geometric = SimpleNamespace(enabled=True, max_candidates_to_verify=10, min_sensor_gap=50)
     geometry = SimpleNamespace(
         min_points=10,
@@ -39,6 +53,8 @@ def make_config(tmp_path: Path, *, gate: bool | None = False, compare: bool | No
         geometric.compare_flow_cov_gate = compare
     if gate is not None:
         geometry.flow_cov_gate_enabled = gate
+    if adaptive_target is not _MISSING:
+        geometry.flow_cov_adaptive_target_points = adaptive_target
     return SimpleNamespace(
         enabled=True,
         vocabulary_path=str(tmp_path / "missing.npz"),
@@ -107,11 +123,16 @@ class FakeFrontend:
         return IStereoDepth.Output(depth=depth, cov=torch.ones_like(depth)), self.output
 
 
-def make_match(covariance: torch.Tensor | None, height: int = 12, width: int = 12) -> IMatcher.Output:
+def make_match(
+    covariance: torch.Tensor | None,
+    height: int = 12,
+    width: int = 12,
+    mask: torch.Tensor | None = None,
+) -> IMatcher.Output:
     return IMatcher.Output(
         flow=torch.zeros((1, 2, height, width), dtype=torch.float32),
         cov=covariance,
-        mask=None,
+        mask=mask,
     )
 
 
@@ -172,6 +193,176 @@ def test_single_frontend_call_feeds_gate_on_and_off(monkeypatch: pytest.MonkeyPa
     assert cov_diag["frontend_score_nonfinite"] == 1
     assert cov_diag["sampled_frontend_threshold"] == 100.0
     assert cov_diag["frontend_score_below_reference"] == 0
+
+
+def test_adaptive_gate_supplements_by_risk_and_preserves_original_order(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    verifier = LoopCandidateVerifier(
+        make_config(tmp_path, adaptive_target=3),
+        FakeFrontend(make_match(covariance_map())),
+    )  # type: ignore[arg-type]
+    record = run_pair(verifier, monkeypatch, [True])[True][0]
+    diagnostics = record.diagnostics
+    assert diagnostics is not None
+    assert diagnostics["selection_mode"] == "adaptive"
+    assert diagnostics["fixed_core_points"] == 1
+    assert diagnostics["adaptive_pool_points"] == 2
+    assert diagnostics["adaptive_added_points"] == 2
+    assert diagnostics["adaptive_final_points_before_match_depth"] == 3
+    assert diagnostics["adaptive_points_after_match_mask"] == 3
+    assert diagnostics["adaptive_points_after_depth"] == 3
+    assert diagnostics["adaptive_shortfall"] == 0
+    assert diagnostics["adaptive_post_filter_shortfall"] == 0
+    assert diagnostics["adaptive_effective_risk_cutoff"] == 150.0
+    assert diagnostics["pnp_correspondence_signature"] == _correspondence_signature(
+        torch.tensor([0, 1, 2])
+    )
+
+
+def test_adaptive_shortfall_and_null_target_legacy_equivalence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    missing = LoopCandidateVerifier(
+        make_config(tmp_path), FakeFrontend(make_match(covariance_map()))
+    )  # type: ignore[arg-type]
+    explicit_null = LoopCandidateVerifier(
+        make_config(tmp_path, adaptive_target=None), FakeFrontend(make_match(covariance_map()))
+    )  # type: ignore[arg-type]
+    adaptive = LoopCandidateVerifier(
+        make_config(tmp_path, adaptive_target=5), FakeFrontend(make_match(covariance_map()))
+    )  # type: ignore[arg-type]
+    fixed_row = run_pair(missing, monkeypatch, [True])[True][0]
+    null_row = run_pair(explicit_null, monkeypatch, [True])[True][0]
+    adaptive_row = run_pair(adaptive, monkeypatch, [True])[True][0]
+    assert fixed_row.diagnostics["pnp_correspondence_signature"] == null_row.diagnostics[  # type: ignore[index]
+        "pnp_correspondence_signature"
+    ]
+    assert fixed_row.diagnostics["after_flow_cov"] == null_row.diagnostics["after_flow_cov"] == 1  # type: ignore[index]
+    assert adaptive_row.diagnostics["adaptive_final_points_before_match_depth"] == 3  # type: ignore[index]
+    assert adaptive_row.diagnostics["adaptive_shortfall"] == 2  # type: ignore[index]
+    assert adaptive_row.diagnostics["adaptive_post_filter_shortfall"] == 2  # type: ignore[index]
+
+
+def test_adaptive_target_is_before_match_mask_and_depth(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    match_mask = torch.ones((1, 1, 12, 12), dtype=torch.bool)
+    points = fixed_points().long()
+    match_mask[0, 0, points[2:, 1], points[2:, 0]] = False
+    verifier = LoopCandidateVerifier(
+        make_config(tmp_path, adaptive_target=3),
+        FakeFrontend(make_match(covariance_map(), mask=match_mask)),
+    )  # type: ignore[arg-type]
+    record = run_pair(verifier, monkeypatch, [True])[True][0]
+    diagnostics = record.diagnostics
+    assert diagnostics is not None
+    assert diagnostics["adaptive_final_points_before_match_depth"] == 3
+    assert diagnostics["adaptive_points_after_match_mask"] == 2
+    assert diagnostics["adaptive_points_after_depth"] == 2
+    assert diagnostics["pnp_input_points"] == 0
+    assert diagnostics["adaptive_post_filter_shortfall"] == 1
+
+
+def test_adaptive_target_config_rejects_bool_and_nonpositive(tmp_path: Path) -> None:
+    LoopClosureManager.is_valid_config(make_config(tmp_path, adaptive_target=1))
+    LoopClosureManager.is_valid_config(make_config(tmp_path, adaptive_target=None))
+    with pytest.raises(ValueError):
+        LoopClosureManager.is_valid_config(make_config(tmp_path, adaptive_target=True))
+    with pytest.raises(ValueError):
+        LoopClosureManager.is_valid_config(make_config(tmp_path, adaptive_target=0))
+
+
+def test_pnp_covariance_statistics_map_inliers_to_original_indices(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = make_config(tmp_path, adaptive_target=3)
+    config.geometry.min_points = 3
+    config.pnp.min_inliers = 2
+    verifier = LoopCandidateVerifier(
+        config, FakeFrontend(make_match(covariance_map()))
+    )  # type: ignore[arg-type]
+    monkeypatch.setattr(
+        verifier,
+        "_run_pnp",
+        lambda *args: (pp.identity_SE3(1), 0.1, np.asarray([0, 2], dtype=np.int64)),
+    )
+    record = run_pair(verifier, monkeypatch, [True])[True][0]
+    diagnostics = record.diagnostics
+    assert record.status == "accepted"
+    assert diagnostics is not None
+    assert diagnostics["pnp_inlier_original_index_count"] == 2
+    assert diagnostics["pnp_inlier_original_index_signature"] == _correspondence_signature(
+        torch.tensor([0, 2])
+    )
+    assert diagnostics["pnp_outlier_original_index_signature"] == _correspondence_signature(
+        torch.tensor([1])
+    )
+    assert diagnostics["pnp_input_covariance_statistics"]["risk_max_uu_vv"]["count"] == 3
+    assert diagnostics["pnp_inlier_covariance_statistics"]["risk_max_uu_vv"]["count"] == 2
+    assert diagnostics["pnp_outlier_covariance_statistics"]["risk_max_uu_vv"]["count"] == 1
+
+
+def test_pnp_failure_does_not_call_all_inputs_outliers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = make_config(tmp_path, adaptive_target=3)
+    config.geometry.min_points = 3
+    verifier = LoopCandidateVerifier(
+        config, FakeFrontend(make_match(covariance_map()))
+    )  # type: ignore[arg-type]
+    monkeypatch.setattr(verifier, "_run_pnp", lambda *args: "PnP RANSAC failed")
+    record = run_pair(verifier, monkeypatch, [True])[True][0]
+    diagnostics = record.diagnostics
+    assert diagnostics is not None
+    assert diagnostics["pnp_input_covariance_statistics"]["risk_max_uu_vv"]["count"] == 3
+    assert diagnostics["pnp_inlier_covariance_statistics"] is None
+    assert diagnostics["pnp_outlier_covariance_statistics"] is None
+
+
+def test_frozen_gt_proxy_uses_sensor_rows_and_timestamp_alignment(tmp_path: Path) -> None:
+    record_dir = tmp_path / "loop_closure"
+    frames = record_dir / "frames"
+    frames.mkdir(parents=True)
+    candidate = make_record(0, 0, 0)
+    current = make_record(300, 300, 30)
+    candidate.save(frames / "candidate.pt")
+    current.save(frames / "current.pt")
+    records = [
+        {"sensor_frame_idx": 0, "file": "frames/candidate.pt"},
+        {"sensor_frame_idx": 300, "file": "frames/current.pt"},
+    ]
+    reference = np.zeros((301, 8), dtype=np.float64)
+    reference[:, 7] = 1.0
+    reference[0, 0] = candidate.frame_ns
+    reference[300, 0] = current.frame_ns
+    np.save(tmp_path / "ref_poses.npy", reference)
+    constraints = {
+        "schema_version": 1,
+        "constraints": [
+            {
+                "src_sensor_frame_idx": 0,
+                "dst_sensor_frame_idx": 300,
+                "pnp_relative_pose": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            }
+        ],
+    }
+    constraints_path = tmp_path / "constraints.json"
+    constraints_path.write_text(json.dumps(constraints), encoding="utf-8")
+    result = evaluate_gt_pose_proxy(
+        constraints_path, tmp_path / "ref_poses.npy", record_dir, records
+    )
+    assert result["evaluated_constraints"] == 1
+    assert result["counts"]["accurate"] == 1
+    assert result["long_span_accurate"] == 1
+
+    reference[300, 0] += 1
+    np.save(tmp_path / "ref_poses.npy", reference)
+    unaligned = evaluate_gt_pose_proxy(
+        constraints_path, tmp_path / "ref_poses.npy", record_dir, records
+    )
+    assert unaligned["evaluated_constraints"] == 0
+    assert unaligned["excluded_unaligned_or_missing"] == 1
 
 
 def test_signature_uses_original_indices_and_seed_is_stable(tmp_path: Path) -> None:

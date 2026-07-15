@@ -12,11 +12,11 @@
 |---|---|
 | 活动代码库 | `MAC-VO-test` |
 | GitHub | `https://github.com/Henry-WYF/MAC-VO_test.git` |
-| 当前分支 / HEAD | `agent-a-codex/loop-geometric-verification` / `645ae11` |
+| 当前分支 / HEAD | `agent-a-codex/loop-geometric-verification` / `a81b56d` |
 | 稳定主线 | `origin/main` / `7b65afe`；已包含本地 GlobalPGO，不是纯上游 MAC-VO |
-| 当前阶段 | 阶段 B 的同源 A/B 协方差门控诊断和本地 CPU 验证已完成；正式 CUDA 完整实验待用户在服务器运行，阶段 C 尚未接入 |
-| 当前唯一优先事项 | 用户在服务器 CUDA 环境复用 `07_11_011209` 缓存运行一次完整同源 A/B 序列实验 |
-| 当前结论 | 阶段 B 尚未达到进入阶段 C 的条件 |
+| 当前阶段 | 阶段 B 自适应 covariance 补点已实现并通过回归；等待服务器四档 CUDA 离线实验，阶段 C 尚未接入 |
+| 当前唯一优先事项 | 在同一缓存上运行 fixed/null、adaptive 50/100/200，并按冻结的 GT 位姿代理选择下一轮候选配置 |
+| 当前结论 | 固定阈值 `100` 是严重的直接阻断项，但 covariance 筛选仍有质量作用；gate-off 不能作为最终方案 |
 | 禁止参考 | `MAC-VO-test_loop`，它是已废弃的早期回环尝试 |
 
 新 Agent 开始修改前必须先执行 `git status --short --branch`。审阅本文件时，工作区还存在用户所有的未提交改动（包括删除的“修改反馈.txt”以及未跟踪文档）；不得擅自恢复、覆盖或一并提交。
@@ -241,15 +241,21 @@ git ls-remote origin
 
 `[代码已核验]` Phase B、Phase A、GlobalPGO 和配置测试共 `45 passed`；全仓排除 `local/trt` 后为 `111 passed, 11 deselected`。本轮相关文件的 `pyright` 为 0 错误；全仓仍有 27 项位于未修改文件的历史或缺依赖错误。
 
-`[实验观察]` 本机已完成 10 个自然 BoW 候选的 CPU 端到端烟雾测试：10 个候选仅调用 10 次 Frontend；7403 个入界有限点在 gate-on 下全部被过滤、gate-off 下全部恢复；gate-off 的 10 个候选均成功执行 PnP RANSAC，其中 9 个未通过内点门限、1 个未通过 VO 位姿一致性门限，最终接受 0 个。严格 JSON、A/B 配对和 pose 不变量均通过。该测试只验证实现链路并表明 covariance gate 是直接过滤阶段，不能证明 covariance 预测错误或 gate-off 约束正确。
+`[实验观察]` 提交 `a81b56d` 已完成 `07_15_043519` 全序列 CUDA 运行：128 个缓存帧产生 1135 个自然候选，1135 次 Frontend 推理，A/B 配对、严格 JSON、主分支归属和 pose 只读不变量全部通过。597380 个入界有限点中，gate-on（`uu/vv <= 100`）仅保留 3992 点、28 个候选到达 PnP、接受 21 个；gate-off 保留全部点、1126 个候选到达 PnP、接受 28 个。两组共同接受 14 个，gate-on 独有 7 个，gate-off 独有 14 个；gate-off 的 1005 个候选仍因 PnP 内点不足被拒绝。
 
-`[待验证]` 正式 1135 候选 CUDA 配对实验由用户在服务器运行；完成后仅将最终漏斗、有限结论和必要复现信息补充到本文件。在此之前不调整 selector、PnP/位姿门限或最终 covariance 阈值，也不进入 Phase C。
+`[实验观察]` 结论：阈值 `100` 仅保留约 0.67% 的点，是 PnP 覆盖率的直接阻断项；但 gate-on 在到达 PnP 后具有更高的条件通过率，且 `ref_poses.npy` 离线代理检查显示 gate-off 同时增加了较准确约束和大误差约束。因此不能声称 covariance 预测错误，也不应永久关闭门限；下一轮应单独审查自适应阈值或按 covariance 排序保留点的方案，仍不得同时修改 PnP/位姿门限或接入 GlobalPGO。
+
+### 7.2 2026-07-15：自适应低风险补点实现
+
+`[代码已核验]` gate-on 可选 `flow_cov_adaptive_target_points`：先保留原 `uu/vv <= 100` 核心点，再按 `max(uu,vv)` 与原始采样索引稳定补足 covariance 阶段目标；缺失或 `null` 完全保持固定门限，gate-off 不变。新增补点前后、PnP 内外点 covariance/原始索引诊断及冻结 GT 位姿代理；不修改 PnP、VO 门限、selector、GlobalPGO 或轨迹。相关 pytest 回归为 `52 passed`。
+
+`[待验证]` CUDA 只在服务器运行。须在 `07_15_043519` 同一缓存分别生成 fixed/null、adaptive 50/100/200 独立结果，先确认新代码 fixed 基线与 `a81b56d` 的签名、PnP 状态、接受集合和约束数值一致，再作单序列 Pareto 判断；完成前不得把 `100` 称为通用默认值。
 
 ## 8. 当前问题、下一步与进入阶段 C 的条件
 
 ### P0：FlowFormerCov 协方差门控
 
-本地实现、回归测试和 CPU 烟雾测试已完成。下一步仅由用户在服务器完成 1135 候选 CUDA 同源 A/B 实验，核验配对、单次推理、pose 不变量和严格 JSON，并报告各级漏斗。完整结果写回本文档后结束本轮；此前不调整其他门限、selector 或 GlobalPGO。
+自适应低风险补点代码已完成，下一步是在服务器对同一缓存运行 fixed/null、adaptive 50/100/200。选择标准为提高 PnP 覆盖与准确代理数量且不增加大误差代理；若同属 Pareto 前沿，优先更小 target/cutoff。不把 gate-off 或单序列胜出 target 直接设为通用默认值，不同时调整 PnP/位姿门限，也不接入 GlobalPGO。
 
 ### P1：召回与验证质量
 
