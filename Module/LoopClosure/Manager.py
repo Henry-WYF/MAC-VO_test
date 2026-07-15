@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
+import uuid
+from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
 import torch
 
 from DataLoader import StereoFrame
@@ -19,6 +23,46 @@ from Utility.PrettyPrint import Logger
 from .Recognizer import CausalBoWDatabase, ORBPlaceRecognizer
 from .Record import LoopFrameRecord
 from .Verification import LoopCandidateVerifier, LoopConstraint, has_required_pnp_functions
+
+
+def _is_int(value: Any, predicate=lambda _: True) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and predicate(value)
+
+
+def _is_number(value: Any, predicate=lambda _: True) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and predicate(value)
+
+
+def _validate_section(
+    config: SimpleNamespace,
+    required: dict[str, Any],
+    optional: dict[str, Any] | None = None,
+) -> None:
+    optional = optional or {}
+    allowed = set(required) | set(optional)
+    excessive = set(vars(config)) - allowed
+    if excessive:
+        raise KeyError(f"Excessive Keys: {excessive} from {sorted(allowed)}")
+    for key, predicate in required.items():
+        if not hasattr(config, key):
+            raise KeyError(f"Config does not match specification! (expect to have key {key} but did not found)")
+        if not predicate(getattr(config, key)):
+            raise ValueError(f"Config does not match specification! ({key}={getattr(config, key)!r})")
+    for key, predicate in optional.items():
+        if hasattr(config, key) and not predicate(getattr(config, key)):
+            raise ValueError(f"Config does not match specification! ({key}={getattr(config, key)!r})")
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, np.generic):
+        return _json_safe(value.item())
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    return value
 
 
 class LoopClosureManager(ConfigTestable):
@@ -46,58 +90,74 @@ class LoopClosureManager(ConfigTestable):
     @classmethod
     def is_valid_config(cls, config: SimpleNamespace | None) -> None:
         assert config is not None
-        base_spec = {
+        base_spec: dict[str, Any] = {
             "enabled": lambda value: isinstance(value, bool),
             "vocabulary_path": lambda value: isinstance(value, str),
-            "keyframe_stride_sensor_frames": lambda value: isinstance(value, int) and value > 0,
-            "temporal_exclusion_sensor_frames": lambda value: isinstance(value, int) and value >= 0,
+            "keyframe_stride_sensor_frames": lambda value: _is_int(value, lambda item: item > 0),
+            "temporal_exclusion_sensor_frames": lambda value: _is_int(value, lambda item: item >= 0),
             "cache_failure_policy": lambda value: value in {"disable_loop", "raise"},
-            "orb_nfeatures": lambda value: isinstance(value, int) and value > 0,
-            "orb_scale_factor": lambda value: isinstance(value, (int, float)) and value > 1.0,
-            "orb_nlevels": lambda value: isinstance(value, int) and value > 0,
-            "top_k": lambda value: isinstance(value, int) and value > 0,
+            "orb_nfeatures": lambda value: _is_int(value, lambda item: item > 0),
+            "orb_scale_factor": lambda value: _is_number(value, lambda item: item > 1.0),
+            "orb_nlevels": lambda value: _is_int(value, lambda item: item > 0),
+            "top_k": lambda value: _is_int(value, lambda item: item > 0),
         }
         cls._enforce_config_spec(config, base_spec, allow_excessive_cfg=True)
         excessive = set(vars(config)) - (set(base_spec) | {"geometric_verification", "geometry", "pnp", "verification", "loop_information"})
         if excessive:
             raise KeyError(f"Excessive Keys: {excessive} from {list(base_spec)}")
         if hasattr(config, "geometric_verification"):
-            cls._enforce_config_spec(config.geometric_verification, {
-                "enabled": lambda value: isinstance(value, bool),
-                "max_candidates_to_verify": lambda value: isinstance(value, int) and value > 0,
-                "min_sensor_gap": lambda value: isinstance(value, int) and value >= 0,
-            })
-            cls._enforce_config_spec(config.geometry, {
-                "min_points": lambda value: isinstance(value, int) and value >= 4,
-                "max_points": lambda value: isinstance(value, int) and value > 0,
-                "max_depth": lambda value: isinstance(value, (int, float)) and value > 0.0,
-                "max_depth_cov": lambda value: isinstance(value, (int, float)) and value >= 0.0,
-                "max_flow_cov": lambda value: isinstance(value, (int, float)) and value >= 0.0,
-                "border": lambda value: isinstance(value, int) and value >= 0,
-                "grid_rows": lambda value: isinstance(value, int) and value > 0,
-                "grid_cols": lambda value: isinstance(value, int) and value > 0,
-                "max_points_per_cell": lambda value: isinstance(value, int) and value > 0,
-            })
-            cls._enforce_config_spec(config.pnp, {
-                "reproj_error_px": lambda value: isinstance(value, (int, float)) and value > 0.0,
-                "confidence": lambda value: isinstance(value, (int, float)) and 0.0 < value < 1.0,
-                "iterations": lambda value: isinstance(value, int) and value > 0,
-                "min_inliers": lambda value: isinstance(value, int) and value >= 4,
-                "min_inlier_ratio": lambda value: isinstance(value, (int, float)) and 0.0 <= value <= 1.0,
+            _validate_section(
+                config.geometric_verification,
+                {
+                    "enabled": lambda value: isinstance(value, bool),
+                    "max_candidates_to_verify": lambda value: _is_int(value, lambda item: item > 0),
+                    "min_sensor_gap": lambda value: _is_int(value, lambda item: item >= 0),
+                },
+                {"compare_flow_cov_gate": lambda value: isinstance(value, bool)},
+            )
+            _validate_section(
+                config.geometry,
+                {
+                    "min_points": lambda value: _is_int(value, lambda item: item >= 4),
+                    "max_points": lambda value: _is_int(value, lambda item: item > 0),
+                    "max_depth": lambda value: _is_number(value, lambda item: item > 0.0),
+                    "max_depth_cov": lambda value: _is_number(value, lambda item: item >= 0.0),
+                    "max_flow_cov": lambda value: _is_number(value, lambda item: item >= 0.0),
+                    "border": lambda value: _is_int(value, lambda item: item >= 0),
+                    "grid_rows": lambda value: _is_int(value, lambda item: item > 0),
+                    "grid_cols": lambda value: _is_int(value, lambda item: item > 0),
+                    "max_points_per_cell": lambda value: _is_int(value, lambda item: item > 0),
+                },
+                {"flow_cov_gate_enabled": lambda value: isinstance(value, bool)},
+            )
+            _validate_section(config.pnp, {
+                "reproj_error_px": lambda value: _is_number(value, lambda item: item > 0.0),
+                "confidence": lambda value: _is_number(value, lambda item: 0.0 < item < 1.0),
+                "iterations": lambda value: _is_int(value, lambda item: item > 0),
+                "min_inliers": lambda value: _is_int(value, lambda item: item >= 4),
+                "min_inlier_ratio": lambda value: _is_number(value, lambda item: 0.0 <= item <= 1.0),
                 "refine": lambda value: isinstance(value, bool),
             })
-            cls._enforce_config_spec(config.verification, {
-                "max_mean_reproj_error_px": lambda value: isinstance(value, (int, float)) and value > 0.0,
-                "max_rotation_diff_deg": lambda value: isinstance(value, (int, float)) and value >= 0.0,
-                "max_translation_diff_m": lambda value: isinstance(value, (int, float)) and value >= 0.0,
+            _validate_section(config.verification, {
+                "max_mean_reproj_error_px": lambda value: _is_number(value, lambda item: item > 0.0),
+                "max_rotation_diff_deg": lambda value: _is_number(value, lambda item: item >= 0.0),
+                "max_translation_diff_m": lambda value: _is_number(value, lambda item: item >= 0.0),
             })
-            cls._enforce_config_spec(config.loop_information, {
-                "trans_weight": lambda value: isinstance(value, (int, float)) and value > 0.0,
-                "rot_weight": lambda value: isinstance(value, (int, float)) and value > 0.0,
+            _validate_section(config.loop_information, {
+                "trans_weight": lambda value: _is_number(value, lambda item: item > 0.0),
+                "rot_weight": lambda value: _is_number(value, lambda item: item > 0.0),
             })
 
     def set_frontend(self, frontend: IFrontend) -> None:
         self.frontend = frontend
+
+    @staticmethod
+    def primary_flow_cov_gate_enabled(config: SimpleNamespace) -> bool:
+        return bool(getattr(config.geometry, "flow_cov_gate_enabled", True))
+
+    @staticmethod
+    def flow_cov_comparison_enabled(config: SimpleNamespace) -> bool:
+        return bool(getattr(config.geometric_verification, "compare_flow_cov_gate", False))
 
     def set_output_dir(self, output_dir: Path) -> None:
         if not self.enabled:
@@ -207,7 +267,183 @@ class LoopClosureManager(ConfigTestable):
     def _record_by_loop_idx(self) -> dict[int, dict[str, Any]]:
         return {int(record["loop_frame_idx"]): record for record in self.records}
 
-    def verify_candidates(self, global_map: VisualMap, queries: list[dict[str, Any]]) -> list[LoopConstraint]:
+    @staticmethod
+    def _summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        funnel_keys = (
+            "candidate_samples",
+            "after_inbound_and_finite",
+            "after_flow_cov",
+            "after_match_mask",
+            "valid_depth_after_flow_points",
+            "geometry_points",
+            "pnp_input_points",
+            "pnp_inliers",
+        )
+        point_totals = {key: 0 for key in funnel_keys}
+        candidate_stage_counts = {key: 0 for key in funnel_keys}
+        covariance_keys = (
+            "uu_finite",
+            "vv_finite",
+            "uv_finite",
+            "gate_channels_joint_finite",
+            "uu_finite_and_below_threshold",
+            "vv_finite_and_below_threshold",
+            "gate_channels_joint_below_threshold",
+            "frontend_score_finite",
+            "frontend_score_nonfinite",
+            "frontend_score_negative",
+            "frontend_score_below_reference",
+        )
+        covariance_totals = {key: 0 for key in covariance_keys}
+        reject_codes: Counter[str] = Counter()
+        for row in rows:
+            if row.get("reject_code") is not None:
+                reject_codes[str(row["reject_code"])] += 1
+            diagnostics = row.get("diagnostics") or {}
+            values = {
+                "candidate_samples": diagnostics.get("candidate_samples"),
+                "after_inbound_and_finite": diagnostics.get("after_inbound_and_finite"),
+                "after_flow_cov": diagnostics.get("after_flow_cov"),
+                "after_match_mask": diagnostics.get("after_match_mask"),
+                "valid_depth_after_flow_points": diagnostics.get("valid_depth_after_flow_points"),
+                "geometry_points": diagnostics.get("geometry_points", row.get("num_geometry_points")),
+                "pnp_input_points": diagnostics.get("pnp_input_points"),
+                "pnp_inliers": row.get("num_pnp_inliers"),
+            }
+            for key, value in values.items():
+                if value is None:
+                    continue
+                count = int(value)
+                point_totals[key] += count
+                if count > 0:
+                    candidate_stage_counts[key] += 1
+            covariance = diagnostics.get("covariance") or {}
+            for key in covariance_keys:
+                value = covariance.get(key)
+                if value is not None:
+                    covariance_totals[key] += int(value)
+        return {
+            "candidate_count": len(rows),
+            "accepted_candidates": sum(row.get("status") == "accepted" for row in rows),
+            "comparison_applicable_candidates": sum(
+                row.get("comparison_applicable") is True for row in rows
+            ),
+            "covariance_available_candidates": sum(
+                (row.get("diagnostics") or {}).get("covariance_available") is True
+                for row in rows
+            ),
+            "reject_code_counts": dict(sorted(reject_codes.items())),
+            "funnel_point_totals": point_totals,
+            "funnel_candidate_counts": candidate_stage_counts,
+            "covariance_diagnostic_mother_set": "after_inbound_and_finite",
+            "covariance_diagnostic_point_totals": covariance_totals,
+            "pnp_attempted_candidates": sum(row.get("pnp_attempted") is True for row in rows),
+            "pnp_ransac_succeeded_candidates": sum(row.get("pnp_ransac_succeeded") is True for row in rows),
+            "pnp_inlier_gate_passed_candidates": sum(row.get("pnp_inlier_gate_passed") is True for row in rows),
+            "reprojection_gate_passed_candidates": sum(row.get("reprojection_gate_passed") is True for row in rows),
+            "pose_consistency_gate_passed_candidates": sum(row.get("pose_consistency_gate_passed") is True for row in rows),
+        }
+
+    @staticmethod
+    def _comparison_summary(
+        gate_enabled_rows: list[dict[str, Any]], gate_disabled_rows: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        enabled = {str(row["comparison_pair_id"]): row for row in gate_enabled_rows}
+        disabled = {str(row["comparison_pair_id"]): row for row in gate_disabled_rows}
+        if len(enabled) != len(gate_enabled_rows) or len(disabled) != len(gate_disabled_rows):
+            raise RuntimeError("duplicate comparison_pair_id in Phase B verification")
+        if set(enabled) != set(disabled):
+            raise RuntimeError("gate-on and gate-off pair_id sets differ")
+
+        applicable = [
+            pair_id
+            for pair_id in enabled
+            if enabled[pair_id].get("comparison_applicable") is True
+            and disabled[pair_id].get("comparison_applicable") is True
+        ]
+
+        def diagnostic(row: dict[str, Any], key: str) -> Any:
+            return (row.get("diagnostics") or {}).get(key)
+
+        after_flow_pairs = [
+            pair_id
+            for pair_id in applicable
+            if diagnostic(enabled[pair_id], "after_flow_cov") is not None
+            and diagnostic(disabled[pair_id], "after_flow_cov") is not None
+        ]
+        pnp_attempted_pairs = [
+            pair_id
+            for pair_id in applicable
+            if enabled[pair_id].get("pnp_attempted") is not None
+            and disabled[pair_id].get("pnp_attempted") is not None
+        ]
+        pnp_ransac_pairs = [
+            pair_id
+            for pair_id in applicable
+            if enabled[pair_id].get("pnp_ransac_succeeded") is not None
+            and disabled[pair_id].get("pnp_ransac_succeeded") is not None
+        ]
+
+        return {
+            "pair_count": len(enabled),
+            "pair_ids_unique_and_aligned": True,
+            "changed_metrics_mother_set": "comparison_applicable_candidates",
+            "comparison_applicable_candidates": len(applicable),
+            "after_flow_cov_compared_candidates": len(after_flow_pairs),
+            "after_flow_cov_changed_candidates": sum(
+                diagnostic(enabled[pair_id], "after_flow_cov")
+                != diagnostic(disabled[pair_id], "after_flow_cov")
+                for pair_id in after_flow_pairs
+            ),
+            "pnp_attempted_compared_candidates": len(pnp_attempted_pairs),
+            "pnp_attempted_changed_candidates": sum(
+                enabled[pair_id].get("pnp_attempted") != disabled[pair_id].get("pnp_attempted")
+                for pair_id in pnp_attempted_pairs
+            ),
+            "pnp_ransac_result_compared_candidates": len(pnp_ransac_pairs),
+            "pnp_ransac_result_changed_candidates": sum(
+                enabled[pair_id].get("pnp_ransac_succeeded")
+                != disabled[pair_id].get("pnp_ransac_succeeded")
+                for pair_id in pnp_ransac_pairs
+            ),
+            "accepted_result_changed_candidates": sum(
+                (enabled[pair_id].get("status") == "accepted")
+                != (disabled[pair_id].get("status") == "accepted")
+                for pair_id in applicable
+            ),
+        }
+
+    def _write_json_bundle(
+        self,
+        payloads: list[tuple[str, dict[str, Any]]],
+        comparison_run_id: str,
+    ) -> None:
+        assert self.output_dir is not None
+        temporary_paths: list[Path] = []
+        try:
+            for filename, payload in payloads:
+                target = self.output_dir / filename
+                temporary = target.with_name(f"{target.name}.{comparison_run_id}.tmp")
+                with open(temporary, "w", encoding="utf-8") as file:
+                    json.dump(_json_safe(payload), file, indent=2, allow_nan=False)
+                    file.flush()
+                    os.fsync(file.fileno())
+                temporary_paths.append(temporary)
+            for (filename, _), temporary in zip(payloads, temporary_paths, strict=True):
+                os.replace(temporary, self.output_dir / filename)
+        finally:
+            for temporary in temporary_paths:
+                if temporary.exists():
+                    temporary.unlink()
+
+    def verify_candidates(
+        self,
+        global_map: VisualMap,
+        queries: list[dict[str, Any]],
+        *,
+        record_dir: Path | None = None,
+        progress_interval: int | None = None,
+    ) -> list[LoopConstraint]:
         if not self.enabled or not self.geometry_enabled:
             return []
         if self.output_dir is None:
@@ -221,37 +457,114 @@ class LoopClosureManager(ConfigTestable):
             return []
 
         record_metadata = self._record_by_loop_idx()
+        record_root = self.output_dir if record_dir is None else Path(record_dir)
+        if not record_root.is_dir():
+            raise RuntimeError(f"loop-frame record directory does not exist: {record_root}")
         verifier = LoopCandidateVerifier(self.config, self.frontend)
-        verification_rows: list[dict[str, Any]] = []
-        constraints: list[LoopConstraint] = []
+        primary_gate_enabled = self.primary_flow_cov_gate_enabled(self.config)
+        comparison_enabled = self.flow_cov_comparison_enabled(self.config)
+        gate_modes = [True, False] if comparison_enabled else [primary_gate_enabled]
+        verification_rows: dict[bool, list[dict[str, Any]]] = {gate: [] for gate in gate_modes}
+        constraints: dict[bool, list[LoopConstraint]] = {gate: [] for gate in gate_modes}
         max_candidates = int(self.config.geometric_verification.max_candidates_to_verify)
+        total_candidates = sum(
+            min(len(query.get("candidates", [])), max_candidates) for query in queries
+        )
+        processed_candidates = 0
+        poses = global_map.frames.data["pose"].tensor
+        pose_snapshot = poses.detach().clone()
+        snapshot_guard = pose_snapshot.clone()
 
         for query in queries:
             current_meta = record_metadata.get(int(query["loop_frame_idx"]))
             if current_meta is None:
-                continue
-            current = LoopFrameRecord.load(self.output_dir / current_meta["file"])
+                raise RuntimeError(f"missing loop-frame metadata for query {query['loop_frame_idx']}")
+            current = LoopFrameRecord.load(record_root / current_meta["file"])
             for candidate in query.get("candidates", [])[:max_candidates]:
                 historical_meta = record_metadata.get(int(candidate["loop_frame_idx"]))
                 if historical_meta is None:
-                    continue
-                historical = LoopFrameRecord.load(self.output_dir / historical_meta["file"])
-                verification, constraint = verifier.verify(global_map, query, candidate, current, historical)
-                verification_rows.append(verification.to_dict())
-                if constraint is not None:
-                    constraints.append(constraint)
+                    raise RuntimeError(
+                        f"missing loop-frame metadata for candidate {candidate['loop_frame_idx']}"
+                    )
+                historical = LoopFrameRecord.load(record_root / historical_meta["file"])
+                branch_results = verifier.verify_branches(
+                    pose_snapshot, query, candidate, current, historical, gate_modes
+                )
+                for gate in gate_modes:
+                    verification, constraint = branch_results[gate]
+                    verification_rows[gate].append(verification.to_dict())
+                    if constraint is not None:
+                        constraints[gate].append(constraint)
+                processed_candidates += 1
+                if (
+                    progress_interval is not None
+                    and progress_interval > 0
+                    and (
+                        processed_candidates % progress_interval == 0
+                        or processed_candidates == total_candidates
+                    )
+                ):
+                    Logger.write(
+                        "info",
+                        f"Loop Phase B verification progress: {processed_candidates} / {total_candidates}",
+                    )
 
-        with open(self.output_dir / "loop_verification.json", "w", encoding="utf-8") as file:
-            json.dump({
-                "schema_version": 1,
+        if not torch.equal(poses, pose_snapshot):
+            raise RuntimeError("Phase B modified VisualMap poses")
+        if not torch.equal(pose_snapshot, snapshot_guard):
+            raise RuntimeError("Phase B modified its pose snapshot")
+
+        comparison_run_id = uuid.uuid4().hex
+        covariance_summary = verifier.aggregate_covariance_statistics()
+        comparison_summary = None
+        if comparison_enabled:
+            comparison_summary = self._comparison_summary(
+                verification_rows[True], verification_rows[False]
+            )
+
+        def verification_payload(gate: bool) -> dict[str, Any]:
+            payload: dict[str, Any] = {
+                "schema_version": 2,
+                "comparison_run_id": comparison_run_id,
+                "primary_gate_enabled": primary_gate_enabled,
+                "comparison_enabled": comparison_enabled,
+                "branch_gate_enabled": gate,
+                "frontend_type": type(self.frontend).__name__,
                 "max_candidates_to_verify": max_candidates,
-                "verifications": verification_rows,
-            }, file, indent=2)
-        with open(self.output_dir / "loop_constraints.json", "w", encoding="utf-8") as file:
-            json.dump({
+                "frontend_inference_calls": verifier.frontend_inference_calls,
+                "candidates_reaching_frontend": verifier.candidates_reaching_frontend,
+                "covariance_statistics": covariance_summary,
+                "summary": self._summarize_rows(verification_rows[gate]),
+                "verifications": verification_rows[gate],
+                "constraints_trust_policy": "trust only after completion marker and pair validation",
+            }
+            if comparison_summary is not None:
+                payload["comparison_summary"] = comparison_summary
+            return payload
+
+        def constraint_payload(gate: bool) -> dict[str, Any]:
+            return {
                 "schema_version": 1,
                 "pose_direction": "relative_pose = T_candidate_current = inverse(T_current_candidate)",
-                "constraints": [constraint.to_dict() for constraint in constraints],
-            }, file, indent=2)
-        Logger.write("info", f"Loop geometric verification accepted {len(constraints)} / {len(verification_rows)} candidates.")
-        return constraints
+                "constraints": [constraint.to_dict() for constraint in constraints[gate]],
+            }
+
+        payloads: list[tuple[str, dict[str, Any]]] = []
+        if comparison_enabled:
+            payloads.extend([
+                ("loop_constraints_gate_enabled.json", constraint_payload(True)),
+                ("loop_constraints_gate_disabled.json", constraint_payload(False)),
+                ("loop_verification_gate_enabled.json", verification_payload(True)),
+                ("loop_verification_gate_disabled.json", verification_payload(False)),
+            ])
+        payloads.append(("loop_constraints.json", constraint_payload(primary_gate_enabled)))
+        payloads.append(("loop_verification.json", verification_payload(primary_gate_enabled)))
+        self._write_json_bundle(payloads, comparison_run_id)
+
+        primary_rows = verification_rows[primary_gate_enabled]
+        primary_constraints = constraints[primary_gate_enabled]
+        Logger.write(
+            "info",
+            f"Loop geometric verification accepted {len(primary_constraints)} / {len(primary_rows)} candidates.",
+        )
+        return primary_constraints

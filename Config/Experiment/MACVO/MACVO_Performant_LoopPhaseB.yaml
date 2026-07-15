@@ -87,12 +87,14 @@ Odometry:
       enabled: true
       max_candidates_to_verify: 10
       min_sensor_gap: 100
+      compare_flow_cov_gate: true
 
     geometry:
       min_points: 30
       max_points: 800
       max_depth: 20.0
       max_depth_cov: 0.05
+      flow_cov_gate_enabled: false
       max_flow_cov: 100.0
       border: 8
       grid_rows: 8

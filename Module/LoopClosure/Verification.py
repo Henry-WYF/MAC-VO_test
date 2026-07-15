@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import hashlib
 import math
 import time
 from dataclasses import asdict, dataclass
@@ -12,7 +14,6 @@ import pypose as pp
 import torch
 
 from Module.Frontend.Frontend import IFrontend
-from Module.Map import VisualMap
 from Module.Optimization.GlobalPGO import make_information
 from Utility.Point import filterPointsInRange, pixel2point_NED
 
@@ -45,6 +46,8 @@ class LoopConstraint:
 
 @dataclass(frozen=True)
 class VerificationRecord:
+    comparison_pair_id: str
+    gate_enabled: bool
     current_sensor_frame_idx: int
     current_visual_map_idx: int
     current_loop_frame_idx: int
@@ -53,25 +56,59 @@ class VerificationRecord:
     candidate_loop_frame_idx: int
     bow_score: float
     status: str
+    reject_code: str | None
     reject_reason: str | None
     elapsed_ms: float
-    num_flow_points: int = 0
-    num_geometry_points: int = 0
-    num_pnp_inliers: int = 0
-    inlier_ratio: float = 0.0
-    mean_reproj_error_px: float = math.inf
-    rotation_diff_deg: float = math.inf
-    translation_diff_m: float = math.inf
+    comparison_applicable: bool | None = None
+    num_flow_points: int | None = None
+    num_geometry_points: int | None = None
+    num_pnp_inliers: int | None = None
+    inlier_ratio: float | None = None
+    mean_reproj_error_px: float | None = None
+    rotation_diff_deg: float | None = None
+    translation_diff_m: float | None = None
     pnp_relative_pose: list[float] | None = None
     relative_pose: list[float] | None = None
+    pnp_attempted: bool | None = None
+    pnp_ransac_succeeded: bool | None = None
+    pnp_inlier_gate_passed: bool | None = None
+    reprojection_gate_passed: bool | None = None
+    pose_consistency_gate_passed: bool | None = None
+    pnp_rng_seed: int | None = None
+    pnp_rng_seed_applied: bool | None = None
     diagnostics: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
+@dataclass
+class PreparedCommon:
+    candidate_uv: torch.Tensor
+    current_uv: torch.Tensor
+    original_indices: torch.Tensor
+    depth: torch.Tensor
+    depth_valid: torch.Tensor
+    match_mask: torch.Tensor | None
+    covariance: torch.Tensor | None
+    covariance_gate_mask: torch.Tensor | None
+    diagnostics: dict[str, Any]
+    comparison_applicable: bool
+
+
+@dataclass
+class CommonRejection:
+    reject_code: str
+    reject_reason: str
+    diagnostics: dict[str, Any] | None = None
+    comparison_applicable: bool | None = None
+
+
 def has_required_pnp_functions() -> bool:
-    return all(hasattr(cv2, name) for name in ("solvePnPRansac", "solvePnPRefineLM", "Rodrigues", "SOLVEPNP_EPNP"))
+    return all(
+        hasattr(cv2, name)
+        for name in ("solvePnPRansac", "solvePnPRefineLM", "Rodrigues", "SOLVEPNP_EPNP")
+    )
 
 
 def _get_config(config: SimpleNamespace, section: str, key: str, default: Any) -> Any:
@@ -81,6 +118,48 @@ def _get_config(config: SimpleNamespace, section: str, key: str, default: Any) -
 
 def _tensor_to_numpy(value: torch.Tensor) -> np.ndarray:
     return value.detach().cpu().numpy()
+
+
+def _empty_statistics() -> dict[str, int | float | None]:
+    return {
+        "count": 0,
+        "min": None,
+        "p25": None,
+        "p50": None,
+        "p75": None,
+        "p90": None,
+        "p95": None,
+        "p99": None,
+        "max": None,
+    }
+
+
+def covariance_statistics(value: torch.Tensor) -> dict[str, int | float | None]:
+    finite = value.detach().cpu().float().reshape(-1)
+    finite = finite[torch.isfinite(finite)]
+    if finite.numel() == 0:
+        return _empty_statistics()
+    quantiles = torch.quantile(
+        finite,
+        torch.tensor([0.25, 0.50, 0.75, 0.90, 0.95, 0.99]),
+        interpolation="linear",
+    )
+    return {
+        "count": int(finite.numel()),
+        "min": float(finite.min().item()),
+        "p25": float(quantiles[0].item()),
+        "p50": float(quantiles[1].item()),
+        "p75": float(quantiles[2].item()),
+        "p90": float(quantiles[3].item()),
+        "p95": float(quantiles[4].item()),
+        "p99": float(quantiles[5].item()),
+        "max": float(finite.max().item()),
+    }
+
+
+def _correspondence_signature(indices: torch.Tensor) -> str:
+    normalized = indices.detach().cpu().to(torch.int64).contiguous().numpy().astype("<i8", copy=False)
+    return hashlib.sha256(normalized.tobytes(order="C")).hexdigest()
 
 
 def _rotation_matrix_to_quaternion_xyzw(matrix: np.ndarray) -> np.ndarray:
@@ -119,28 +198,17 @@ def _rotation_matrix_to_quaternion_xyzw(matrix: np.ndarray) -> np.ndarray:
 
 def _opencv_pose_to_ned_se3(rvec: np.ndarray, tvec: np.ndarray) -> pp.LieTensor:
     rotation_cv, _ = cv2.Rodrigues(rvec)
-    rotation_cv = np.asarray(rotation_cv, dtype=np.float64)
     translation_cv = np.asarray(tvec, dtype=np.float64).reshape(3)
-
-    # NED camera coordinates are [forward, right, down]. OpenCV uses [right, down, forward].
-    ned_to_cv = np.asarray(
-        [
-            [0.0, 1.0, 0.0],
-            [0.0, 0.0, 1.0],
-            [1.0, 0.0, 0.0],
-        ],
-        dtype=np.float64,
-    )
+    ned_to_cv = np.asarray([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]], dtype=np.float64)
     cv_to_ned = ned_to_cv.T
-    rotation_ned = cv_to_ned @ rotation_cv @ ned_to_cv
+    rotation_ned = cv_to_ned @ np.asarray(rotation_cv, dtype=np.float64) @ ned_to_cv
     translation_ned = cv_to_ned @ translation_cv
     quaternion = _rotation_matrix_to_quaternion_xyzw(rotation_ned)
     return pp.SE3(torch.tensor(np.concatenate([translation_ned, quaternion]), dtype=torch.float32))
 
 
 def _pose_error(measured: pp.LieTensor, reference: pp.LieTensor) -> tuple[float, float]:
-    delta = measured.Inv() @ reference
-    residual = delta.Log().tensor().detach().cpu().double()
+    residual = (measured.Inv() @ reference).Log().tensor().detach().cpu().double()
     translation = float(torch.linalg.vector_norm(residual[..., :3]))
     rotation_deg = float(torch.linalg.vector_norm(residual[..., 3:]) * 180.0 / math.pi)
     return rotation_deg, translation
@@ -150,30 +218,99 @@ class LoopCandidateVerifier:
     def __init__(self, config: SimpleNamespace, frontend: IFrontend) -> None:
         self.config = config
         self.frontend = frontend
+        self.frontend_inference_calls = 0
+        self.candidates_reaching_frontend = 0
+        self._aggregate_covariance: dict[str, list[torch.Tensor]] = {
+            "uu": [],
+            "vv": [],
+            "uv": [],
+            "sampled_frontend_score": [],
+        }
 
-    def verify(
+    @staticmethod
+    def _pair_id(query: dict[str, Any], candidate: dict[str, Any]) -> str:
+        return f"{int(query['loop_frame_idx'])}:{int(candidate['loop_frame_idx'])}"
+
+    @staticmethod
+    def _pnp_seed(query: dict[str, Any], candidate: dict[str, Any]) -> int:
+        return (
+            int(query["sensor_frame_idx"]) * 1_000_003 + int(candidate["sensor_frame_idx"])
+        ) & 0x7FFFFFFF
+
+    def aggregate_covariance_statistics(self) -> dict[str, Any]:
+        summary: dict[str, Any] = {"interpolation": "linear"}
+        for name, parts in self._aggregate_covariance.items():
+            values = torch.cat(parts) if parts else torch.empty(0, dtype=torch.float32)
+            summary[name] = covariance_statistics(values)
+        return summary
+
+    def verify_branches(
         self,
-        global_map: VisualMap,
+        pose_snapshot: torch.Tensor,
         query: dict[str, Any],
         candidate: dict[str, Any],
         current: LoopFrameRecord,
         historical: LoopFrameRecord,
-    ) -> tuple[VerificationRecord, LoopConstraint | None]:
+        gate_modes: list[bool],
+    ) -> dict[bool, tuple[VerificationRecord, LoopConstraint | None]]:
         started = time.perf_counter()
         try:
-            return self._verify_impl(global_map, query, candidate, current, historical, started)
+            common = self._prepare_once(query, candidate, current, historical)
         except Exception as error:
-            return self._reject(query, candidate, started, f"exception: {error}"), None
+            common = CommonRejection("verification_exception", f"common preparation exception: {error}")
+        if isinstance(common, CommonRejection):
+            return {
+                gate: (
+                    self._reject(
+                        query,
+                        candidate,
+                        gate,
+                        started,
+                        common.reject_code,
+                        common.reject_reason,
+                        comparison_applicable=common.comparison_applicable,
+                        diagnostics=copy.deepcopy(common.diagnostics),
+                    ),
+                    None,
+                )
+                for gate in gate_modes
+            }
+
+        results: dict[bool, tuple[VerificationRecord, LoopConstraint | None]] = {}
+        for gate in gate_modes:
+            try:
+                results[gate] = self._verify_branch(
+                    pose_snapshot, query, candidate, current, historical, common, gate, started
+                )
+            except Exception as error:
+                results[gate] = (
+                    self._reject(
+                        query,
+                        candidate,
+                        gate,
+                        started,
+                        "verification_exception",
+                        f"exception: {error}",
+                        comparison_applicable=common.comparison_applicable,
+                        diagnostics=copy.deepcopy(common.diagnostics),
+                    ),
+                    None,
+                )
+        return results
 
     def _reject(
         self,
         query: dict[str, Any],
         candidate: dict[str, Any],
+        gate_enabled: bool,
         started: float,
+        reject_code: str,
         reason: str,
         **kwargs: Any,
     ) -> VerificationRecord:
         return VerificationRecord(
+            comparison_pair_id=self._pair_id(query, candidate),
+            gate_enabled=gate_enabled,
             current_sensor_frame_idx=int(query["sensor_frame_idx"]),
             current_visual_map_idx=int(query["visual_map_idx"]),
             current_loop_frame_idx=int(query["loop_frame_idx"]),
@@ -182,98 +319,456 @@ class LoopCandidateVerifier:
             candidate_loop_frame_idx=int(candidate["loop_frame_idx"]),
             bow_score=float(candidate.get("score", 0.0)),
             status="rejected",
+            reject_code=reject_code,
             reject_reason=reason,
             elapsed_ms=(time.perf_counter() - started) * 1000.0,
             **kwargs,
         )
 
-    def _verify_impl(
+    def _prepare_once(
         self,
-        global_map: VisualMap,
         query: dict[str, Any],
         candidate: dict[str, Any],
         current: LoopFrameRecord,
         historical: LoopFrameRecord,
-        started: float,
-    ) -> tuple[VerificationRecord, LoopConstraint | None]:
+    ) -> PreparedCommon | CommonRejection:
         current_sensor = int(query["sensor_frame_idx"])
         candidate_sensor = int(candidate["sensor_frame_idx"])
         if candidate_sensor >= current_sensor:
-            return self._reject(query, candidate, started, "candidate is not earlier than current frame"), None
+            return CommonRejection("invalid_candidate_order", "candidate is not earlier than current frame")
         min_gap = int(getattr(self.config.geometric_verification, "min_sensor_gap", 100))
         if current_sensor - candidate_sensor < min_gap:
-            return self._reject(query, candidate, started, "candidate is inside min_sensor_gap"), None
+            return CommonRejection("inside_min_gap", "candidate is inside min_sensor_gap")
 
-        depth_current, match = self.frontend.estimate_pair(
-            historical.to_stereo_data(getattr(self.frontend.config, "device", "cpu")),
-            current.to_stereo_data(getattr(self.frontend.config, "device", "cpu")),
-        )
-        del depth_current  # Current-frame depth is not the source of PnP 3D points.
-
-        candidate_uv = self._sample_candidate_uv(historical)
-        if candidate_uv.size(0) == 0:
-            return self._reject(
-                query, candidate, started, "no valid candidate depth pixels",
+        candidate_uv_cpu = self._sample_candidate_uv(historical)
+        if candidate_uv_cpu.size(0) == 0:
+            return CommonRejection(
+                "no_candidate_depth_pixels",
+                "no valid candidate depth pixels",
                 diagnostics={"candidate_samples": 0},
-            ), None
+            )
 
-        prepared = self._prepare_correspondences(historical, current, match, candidate_uv)
-        if isinstance(prepared[0], str):
-            reason, diagnostics = prepared
-            return self._reject(query, candidate, started, reason, diagnostics=diagnostics), None
-        candidate_uv, current_uv, points_ned, points_cv, flow_count, diagnostics = prepared
-        min_points = int(_get_config(self.config, "geometry", "min_points", 80))
-        if points_cv.shape[0] < min_points:
+        self.candidates_reaching_frontend += 1
+        self.frontend_inference_calls += 1
+        try:
+            depth_current, match = self.frontend.estimate_pair(
+                historical.to_stereo_data(getattr(self.frontend.config, "device", "cpu")),
+                current.to_stereo_data(getattr(self.frontend.config, "device", "cpu")),
+            )
+            del depth_current
+        except Exception as error:
+            return CommonRejection("verification_exception", f"frontend exception: {error}")
+
+        if getattr(match, "flow", None) is None:
+            return CommonRejection(
+                "missing_flow",
+                "flow is missing",
+                diagnostics={"candidate_samples": int(candidate_uv_cpu.size(0))},
+            )
+
+        flow_map = match.flow
+        device = flow_map.device
+        candidate_uv = candidate_uv_cpu.to(device=device, dtype=torch.float32)
+        flow = IFrontend.retrieve_pixels(candidate_uv, flow_map)
+        if flow is None:
+            return CommonRejection("missing_flow", "flow is missing")
+        current_uv = candidate_uv + flow.T
+        inbound = filterPointsInRange(
+            current_uv,
+            (0, int(current.width) - 1),
+            (0, int(current.height) - 1),
+        )
+        finite_flow = torch.isfinite(flow).all(dim=0)
+        base_mask = inbound & finite_flow
+        original_indices = torch.arange(candidate_uv.size(0), device=device, dtype=torch.long)
+
+        frontend_type = type(self.frontend).__name__
+        diagnostics: dict[str, Any] = {
+            "frontend_type": frontend_type,
+            "uv_synthesized_zero_by_frontend_contract": frontend_type in {
+                "FlowFormerCovFrontend",
+                "CUDAGraph_FlowFormerCovFrontend",
+            },
+            "candidate_samples": int(candidate_uv.size(0)),
+            "finite_flow_points": int(finite_flow.sum().item()),
+            "inbound_flow_points": int(inbound.sum().item()),
+            "after_inbound_and_finite": int(base_mask.sum().item()),
+            "covariance_statistics_mother_set": "after_inbound_and_finite",
+            "quantile_interpolation": "linear",
+            "flow_cov_threshold": float(_get_config(self.config, "geometry", "max_flow_cov", 1.0)),
+        }
+
+        covariance_map = getattr(match, "cov", None)
+        covariance: torch.Tensor | None = None
+        covariance_gate_mask: torch.Tensor | None = None
+        covariance_available = False
+        if covariance_map is not None:
+            if (
+                covariance_map.ndim != 4
+                or covariance_map.shape[0] < 1
+                or covariance_map.shape[1] != 3
+                or covariance_map.shape[-2:] != flow_map.shape[-2:]
+            ):
+                diagnostics["covariance_available"] = False
+                return CommonRejection(
+                    "invalid_covariance_layout",
+                    f"invalid covariance shape {tuple(covariance_map.shape)} for flow {tuple(flow_map.shape)}",
+                    diagnostics=diagnostics,
+                    comparison_applicable=False,
+                )
+            sampled_covariance = IFrontend.retrieve_pixels(candidate_uv, covariance_map)
+            if sampled_covariance is None:
+                diagnostics["covariance_available"] = False
+                return CommonRejection(
+                    "invalid_covariance_layout",
+                    "covariance sampling failed",
+                    diagnostics=diagnostics,
+                    comparison_applicable=False,
+                )
+            covariance = sampled_covariance[:, base_mask]
+            covariance_available = True
+            assert covariance is not None
+            covariance_gate_mask = self._covariance_diagnostics(covariance, diagnostics)
+        else:
+            self._missing_covariance_diagnostics(diagnostics)
+
+        comparison_applicable = covariance_available and int(base_mask.sum().item()) > 0
+        diagnostics["covariance_available"] = covariance_available
+        diagnostics["comparison_applicable"] = comparison_applicable
+
+        base_candidate_uv = candidate_uv[base_mask]
+        base_current_uv = current_uv[base_mask]
+        base_indices = original_indices[base_mask]
+
+        sampled_match_mask: torch.Tensor | None = None
+        if getattr(match, "mask", None) is not None:
+            retrieved_mask = IFrontend.retrieve_pixels(candidate_uv, match.mask)
+            if retrieved_mask is not None:
+                sampled_match_mask = retrieved_mask.squeeze(0).bool()[base_mask]
+                diagnostics["match_mask_available"] = True
+                diagnostics["match_mask_pass_points"] = int(sampled_match_mask.sum().item())
+            else:
+                diagnostics["match_mask_available"] = False
+        else:
+            diagnostics["match_mask_available"] = False
+
+        depth_map = historical.depth.to(device=device, dtype=torch.float32)
+        depth = IFrontend.retrieve_pixels(base_candidate_uv, depth_map)
+        if depth is None:
+            return CommonRejection(
+                "missing_candidate_depth",
+                "candidate depth is missing",
+                diagnostics=diagnostics,
+                comparison_applicable=comparison_applicable,
+            )
+        depth = depth.squeeze(0)
+        depth_valid = torch.isfinite(depth) & (depth > 0.0)
+
+        return PreparedCommon(
+            candidate_uv=base_candidate_uv,
+            current_uv=base_current_uv,
+            original_indices=base_indices,
+            depth=depth,
+            depth_valid=depth_valid,
+            match_mask=sampled_match_mask,
+            covariance=covariance,
+            covariance_gate_mask=covariance_gate_mask,
+            diagnostics=diagnostics,
+            comparison_applicable=comparison_applicable,
+        )
+
+    def _covariance_diagnostics(
+        self, covariance: torch.Tensor, diagnostics: dict[str, Any]
+    ) -> torch.Tensor:
+        uu, vv, uv = covariance[0], covariance[1], covariance[2]
+        threshold = float(diagnostics["flow_cov_threshold"])
+        uu_finite = torch.isfinite(uu)
+        vv_finite = torch.isfinite(vv)
+        uv_finite = torch.isfinite(uv)
+        joint_finite = uu_finite & vv_finite
+        uu_pass = uu_finite & (uu <= threshold)
+        vv_pass = vv_finite & (vv <= threshold)
+        joint_pass = joint_finite & (uu <= threshold) & (vv <= threshold)
+        score = uu + vv - 2.0 * uv
+        score_finite = torch.isfinite(score)
+        finite_score = score[score_finite]
+        if finite_score.numel() > 0:
+            reference_threshold: float | None = min(100.0, float(finite_score.median().item()) * 1.5)
+            reference_pass = score_finite & (score < reference_threshold)
+        else:
+            reference_threshold = None
+            reference_pass = torch.zeros_like(score_finite)
+
+        diagnostics["covariance"] = {
+            "layout": ["uu", "vv", "uv"],
+            "uu": covariance_statistics(uu),
+            "vv": covariance_statistics(vv),
+            "uv": covariance_statistics(uv),
+            "uu_finite": int(uu_finite.sum().item()),
+            "vv_finite": int(vv_finite.sum().item()),
+            "uv_finite": int(uv_finite.sum().item()),
+            "uv_all_zero": (
+                None
+                if int(uv_finite.sum().item()) == 0
+                else bool((uv[uv_finite] == 0).all().item())
+            ),
+            "gate_channels_joint_finite": int(joint_finite.sum().item()),
+            "uu_finite_and_below_threshold": int(uu_pass.sum().item()),
+            "vv_finite_and_below_threshold": int(vv_pass.sum().item()),
+            "gate_channels_joint_below_threshold": int(joint_pass.sum().item()),
+            "sampled_frontend_score": covariance_statistics(score),
+            "frontend_score_finite": int(score_finite.sum().item()),
+            "frontend_score_nonfinite": int(score.numel() - score_finite.sum().item()),
+            "frontend_score_negative": int((score_finite & (score < 0)).sum().item()),
+            "sampled_frontend_threshold": reference_threshold,
+            "frontend_score_below_reference": int(reference_pass.sum().item()),
+            "frontend_reference_kind": "sampled/no_dense_nms",
+            "frontend_reference_operator": "strict_less_than",
+        }
+        for name, values in (("uu", uu), ("vv", vv), ("uv", uv), ("sampled_frontend_score", score)):
+            finite = values[torch.isfinite(values)].detach().cpu().float()
+            if finite.numel() > 0:
+                self._aggregate_covariance[name].append(finite)
+        return joint_pass
+
+    @staticmethod
+    def _missing_covariance_diagnostics(diagnostics: dict[str, Any]) -> None:
+        diagnostics["covariance"] = {
+            "layout": ["uu", "vv", "uv"],
+            "uu": _empty_statistics(),
+            "vv": _empty_statistics(),
+            "uv": _empty_statistics(),
+            "uu_finite": 0,
+            "vv_finite": 0,
+            "uv_finite": 0,
+            "uv_all_zero": None,
+            "gate_channels_joint_finite": 0,
+            "uu_finite_and_below_threshold": 0,
+            "vv_finite_and_below_threshold": 0,
+            "gate_channels_joint_below_threshold": 0,
+            "sampled_frontend_score": _empty_statistics(),
+            "frontend_score_finite": 0,
+            "frontend_score_nonfinite": 0,
+            "frontend_score_negative": 0,
+            "sampled_frontend_threshold": None,
+            "frontend_score_below_reference": 0,
+            "frontend_reference_kind": "sampled/no_dense_nms",
+            "frontend_reference_operator": "strict_less_than",
+        }
+
+    def _verify_branch(
+        self,
+        pose_snapshot: torch.Tensor,
+        query: dict[str, Any],
+        candidate: dict[str, Any],
+        current: LoopFrameRecord,
+        historical: LoopFrameRecord,
+        common: PreparedCommon,
+        gate_enabled: bool,
+        started: float,
+    ) -> tuple[VerificationRecord, LoopConstraint | None]:
+        diagnostics = copy.deepcopy(common.diagnostics)
+        mask = torch.ones(common.candidate_uv.size(0), dtype=torch.bool, device=common.candidate_uv.device)
+        if gate_enabled and common.covariance is not None:
+            assert common.covariance_gate_mask is not None
+            mask &= common.covariance_gate_mask
+            diagnostics["gate_applied"] = True
+            diagnostics["gate_skip_reason"] = None
+        else:
+            diagnostics["gate_applied"] = False
+            diagnostics["gate_skip_reason"] = (
+                "disabled_by_config" if not gate_enabled else "covariance_unavailable"
+            )
+        diagnostics["gate_requested"] = gate_enabled
+        diagnostics["after_flow_cov"] = int(mask.sum().item())
+
+        if common.match_mask is not None:
+            mask &= common.match_mask
+        diagnostics["after_match_mask"] = int(mask.sum().item())
+
+        flow_count = int(mask.sum().item())
+        diagnostics["flow_points"] = flow_count
+        if flow_count == 0:
+            diagnostics["valid_depth_after_flow_points"] = 0
+            diagnostics["geometry_points"] = 0
+            diagnostics["pnp_correspondence_count"] = 0
+            diagnostics["pnp_correspondence_signature"] = _correspondence_signature(
+                common.original_indices[:0]
+            )
+            diagnostics["pnp_input_points"] = 0
             return self._reject(
-                query, candidate, started, "not enough geometry points",
-                num_flow_points=flow_count, num_geometry_points=int(points_cv.shape[0]),
+                query,
+                candidate,
+                gate_enabled,
+                started,
+                "no_valid_flow_correspondences",
+                "no valid flow correspondences",
+                comparison_applicable=common.comparison_applicable,
+                pnp_attempted=False,
                 diagnostics=diagnostics,
             ), None
 
+        depth_mask = common.depth_valid[mask]
+        diagnostics["valid_depth_after_flow_points"] = int(depth_mask.sum().item())
+        selected = torch.nonzero(mask, as_tuple=False).squeeze(1)
+        selected = selected[depth_mask]
+        geometry_count = int(selected.numel())
+        diagnostics["geometry_points"] = geometry_count
+        original_indices = common.original_indices[selected]
+        diagnostics["pnp_correspondence_count"] = geometry_count
+        diagnostics["pnp_correspondence_signature"] = _correspondence_signature(original_indices)
+        if geometry_count == 0:
+            diagnostics["pnp_input_points"] = 0
+            return self._reject(
+                query,
+                candidate,
+                gate_enabled,
+                started,
+                "no_valid_candidate_depths",
+                "no valid candidate depths after flow filtering",
+                comparison_applicable=common.comparison_applicable,
+                num_flow_points=flow_count,
+                pnp_attempted=False,
+                diagnostics=diagnostics,
+            ), None
+
+        min_points = int(_get_config(self.config, "geometry", "min_points", 80))
+        if geometry_count < min_points:
+            diagnostics["pnp_input_points"] = 0
+            return self._reject(
+                query,
+                candidate,
+                gate_enabled,
+                started,
+                "insufficient_geometry_points",
+                "not enough geometry points",
+                comparison_applicable=common.comparison_applicable,
+                num_flow_points=flow_count,
+                num_geometry_points=geometry_count,
+                pnp_attempted=False,
+                diagnostics=diagnostics,
+            ), None
+
+        candidate_uv = common.candidate_uv[selected]
+        current_uv = common.current_uv[selected]
+        depth = common.depth[selected]
+        frame_K = historical.intrinsic[0] if historical.intrinsic.ndim == 3 else historical.intrinsic
+        frame_K = frame_K.to(device=candidate_uv.device, dtype=torch.float32)
+        points_ned = pixel2point_NED(candidate_uv, depth, frame_K).float()
+        points_cv = _tensor_to_numpy(points_ned.roll(shifts=-1, dims=-1).float())
+        diagnostics["pnp_input_points"] = geometry_count
+
+        seed = self._pnp_seed(query, candidate)
+        rng_applied = False
+        if hasattr(cv2, "setRNGSeed"):
+            cv2.setRNGSeed(seed)
+            rng_applied = True
         pnp = self._run_pnp(current, points_cv, current_uv)
         if isinstance(pnp, str):
+            reject_code = "pnp_insufficient_points" if pnp == "not enough points for PnP" else "pnp_failed"
             return self._reject(
-                query, candidate, started, pnp,
-                num_flow_points=flow_count, num_geometry_points=int(points_cv.shape[0]),
+                query,
+                candidate,
+                gate_enabled,
+                started,
+                reject_code,
+                pnp,
+                comparison_applicable=common.comparison_applicable,
+                num_flow_points=flow_count,
+                num_geometry_points=geometry_count,
+                pnp_attempted=True,
+                pnp_ransac_succeeded=False,
+                pnp_rng_seed=seed,
+                pnp_rng_seed_applied=rng_applied,
                 diagnostics=diagnostics,
             ), None
+
         T_current_candidate, mean_error, inliers = pnp
         inlier_count = int(len(inliers))
-        inlier_ratio = inlier_count / max(int(points_cv.shape[0]), 1)
+        inlier_ratio = inlier_count / max(geometry_count, 1)
         min_inliers = int(_get_config(self.config, "pnp", "min_inliers", 50))
         min_inlier_ratio = float(_get_config(self.config, "pnp", "min_inlier_ratio", 0.25))
-        if inlier_count < min_inliers or inlier_ratio < min_inlier_ratio:
+        inlier_gate_passed = inlier_count >= min_inliers and inlier_ratio >= min_inlier_ratio
+        if not inlier_gate_passed:
             return self._reject(
-                query, candidate, started, "not enough PnP inliers",
-                num_flow_points=flow_count, num_geometry_points=int(points_cv.shape[0]),
-                num_pnp_inliers=inlier_count, inlier_ratio=inlier_ratio, mean_reproj_error_px=mean_error,
+                query,
+                candidate,
+                gate_enabled,
+                started,
+                "insufficient_pnp_inliers",
+                "not enough PnP inliers",
+                comparison_applicable=common.comparison_applicable,
+                num_flow_points=flow_count,
+                num_geometry_points=geometry_count,
+                num_pnp_inliers=inlier_count,
+                inlier_ratio=inlier_ratio,
+                mean_reproj_error_px=mean_error,
+                pnp_attempted=True,
+                pnp_ransac_succeeded=True,
+                pnp_inlier_gate_passed=False,
+                pnp_rng_seed=seed,
+                pnp_rng_seed_applied=rng_applied,
                 diagnostics=diagnostics,
             ), None
 
         max_reproj = float(_get_config(self.config, "verification", "max_mean_reproj_error_px", 3.0))
-        if mean_error > max_reproj:
+        reprojection_passed = mean_error <= max_reproj
+        if not reprojection_passed:
             return self._reject(
-                query, candidate, started, "mean reprojection error is too high",
-                num_flow_points=flow_count, num_geometry_points=int(points_cv.shape[0]),
-                num_pnp_inliers=inlier_count, inlier_ratio=inlier_ratio, mean_reproj_error_px=mean_error,
+                query,
+                candidate,
+                gate_enabled,
+                started,
+                "reprojection_error",
+                "mean reprojection error is too high",
+                comparison_applicable=common.comparison_applicable,
+                num_flow_points=flow_count,
+                num_geometry_points=geometry_count,
+                num_pnp_inliers=inlier_count,
+                inlier_ratio=inlier_ratio,
+                mean_reproj_error_px=mean_error,
+                pnp_attempted=True,
+                pnp_ransac_succeeded=True,
+                pnp_inlier_gate_passed=True,
+                reprojection_gate_passed=False,
+                pnp_rng_seed=seed,
+                pnp_rng_seed_applied=rng_applied,
                 diagnostics=diagnostics,
             ), None
 
         T_edge = T_current_candidate.Inv()
-        T_w_src = pp.SE3(global_map.frames.data["pose"][historical.visual_map_idx])
-        T_w_dst = pp.SE3(global_map.frames.data["pose"][current.visual_map_idx])
+        T_w_src = pp.SE3(pose_snapshot[historical.visual_map_idx])
+        T_w_dst = pp.SE3(pose_snapshot[current.visual_map_idx])
         vo_edge = T_w_src.Inv() @ T_w_dst
         rotation_diff, translation_diff = _pose_error(T_edge, vo_edge)
         max_rot = float(_get_config(self.config, "verification", "max_rotation_diff_deg", 35.0))
         max_trans = float(_get_config(self.config, "verification", "max_translation_diff_m", 8.0))
-        if rotation_diff > max_rot or translation_diff > max_trans:
+        pose_passed = rotation_diff <= max_rot and translation_diff <= max_trans
+        if not pose_passed:
             return self._reject(
-                query, candidate, started, "relative pose is inconsistent with VO trajectory",
-                num_flow_points=flow_count, num_geometry_points=int(points_cv.shape[0]),
-                num_pnp_inliers=inlier_count, inlier_ratio=inlier_ratio, mean_reproj_error_px=mean_error,
-                rotation_diff_deg=rotation_diff, translation_diff_m=translation_diff,
+                query,
+                candidate,
+                gate_enabled,
+                started,
+                "pose_inconsistent",
+                "relative pose is inconsistent with VO trajectory",
+                comparison_applicable=common.comparison_applicable,
+                num_flow_points=flow_count,
+                num_geometry_points=geometry_count,
+                num_pnp_inliers=inlier_count,
+                inlier_ratio=inlier_ratio,
+                mean_reproj_error_px=mean_error,
+                rotation_diff_deg=rotation_diff,
+                translation_diff_m=translation_diff,
                 pnp_relative_pose=T_current_candidate.tensor().detach().cpu().tolist(),
                 relative_pose=T_edge.tensor().detach().cpu().tolist(),
+                pnp_attempted=True,
+                pnp_ransac_succeeded=True,
+                pnp_inlier_gate_passed=True,
+                reprojection_gate_passed=True,
+                pose_consistency_gate_passed=False,
+                pnp_rng_seed=seed,
+                pnp_rng_seed_applied=rng_applied,
                 diagnostics=diagnostics,
             ), None
 
@@ -292,16 +787,17 @@ class LoopCandidateVerifier:
             information=information.detach().cpu().tolist(),
             bow_score=float(candidate.get("score", 0.0)),
             num_flow_points=flow_count,
-            num_geometry_points=int(points_cv.shape[0]),
+            num_geometry_points=geometry_count,
             num_pnp_inliers=inlier_count,
             inlier_ratio=inlier_ratio,
             mean_reproj_error_px=mean_error,
             rotation_diff_deg=rotation_diff,
             translation_diff_m=translation_diff,
             status="accepted",
-            reject_reason=None,
         )
         verification = VerificationRecord(
+            comparison_pair_id=self._pair_id(query, candidate),
+            gate_enabled=gate_enabled,
             current_sensor_frame_idx=int(current.sensor_frame_idx),
             current_visual_map_idx=int(current.visual_map_idx),
             current_loop_frame_idx=int(current.loop_frame_idx),
@@ -310,10 +806,12 @@ class LoopCandidateVerifier:
             candidate_loop_frame_idx=int(historical.loop_frame_idx),
             bow_score=float(candidate.get("score", 0.0)),
             status="accepted",
+            reject_code=None,
             reject_reason=None,
             elapsed_ms=(time.perf_counter() - started) * 1000.0,
+            comparison_applicable=common.comparison_applicable,
             num_flow_points=flow_count,
-            num_geometry_points=int(points_cv.shape[0]),
+            num_geometry_points=geometry_count,
             num_pnp_inliers=inlier_count,
             inlier_ratio=inlier_ratio,
             mean_reproj_error_px=mean_error,
@@ -321,6 +819,13 @@ class LoopCandidateVerifier:
             translation_diff_m=translation_diff,
             pnp_relative_pose=constraint.pnp_relative_pose,
             relative_pose=constraint.relative_pose,
+            pnp_attempted=True,
+            pnp_ransac_succeeded=True,
+            pnp_inlier_gate_passed=True,
+            reprojection_gate_passed=True,
+            pose_consistency_gate_passed=True,
+            pnp_rng_seed=seed,
+            pnp_rng_seed_applied=rng_applied,
             diagnostics=diagnostics,
         )
         return verification, constraint
@@ -362,96 +867,13 @@ class LoopCandidateVerifier:
                     take = torch.linspace(0, coords.size(0) - 1, per_cell).round().long()
                     coords = coords[take]
                 selected.append(coords)
-        if len(selected) == 0:
+        if not selected:
             return torch.empty((0, 2), dtype=torch.float32)
         points = torch.cat(selected, dim=0)
         if points.size(0) > max_points:
             take = torch.linspace(0, points.size(0) - 1, max_points).round().long()
             points = points[take]
         return points
-
-    def _prepare_correspondences(
-        self,
-        historical: LoopFrameRecord,
-        current: LoopFrameRecord,
-        match: Any,
-        candidate_uv_cpu: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, np.ndarray, int, dict[str, Any]] | tuple[str, dict[str, Any]]:
-        diagnostics: dict[str, Any] = {
-            "candidate_samples": int(candidate_uv_cpu.size(0)),
-            "flow_cov_threshold": float(_get_config(self.config, "geometry", "max_flow_cov", 1.0)),
-        }
-        device = match.flow.device
-        candidate_uv = candidate_uv_cpu.to(device=device, dtype=torch.float32)
-        flow = IFrontend.retrieve_pixels(candidate_uv, match.flow)
-        if flow is None:
-            return "flow is missing", diagnostics
-        current_uv = candidate_uv + flow.T
-        inbound = filterPointsInRange(
-            current_uv,
-            (0, int(current.width) - 1),
-            (0, int(current.height) - 1),
-        )
-        finite_flow = torch.isfinite(flow).all(dim=0)
-        diagnostics["finite_flow_points"] = int(finite_flow.sum().item())
-        diagnostics["inbound_flow_points"] = int(inbound.sum().item())
-        mask = inbound & finite_flow
-        diagnostics["after_inbound_and_finite"] = int(mask.sum().item())
-        flow_cov = IFrontend.retrieve_pixels(candidate_uv, match.cov)
-        if flow_cov is not None:
-            max_flow_cov = float(_get_config(self.config, "geometry", "max_flow_cov", 1.0))
-            cov_finite = torch.isfinite(flow_cov[:2]).all(dim=0)
-            cov_pass = (flow_cov[:2] <= max_flow_cov).all(dim=0)
-            diagnostics["flow_cov_available"] = True
-            diagnostics["flow_cov_finite_points"] = int(cov_finite.sum().item())
-            diagnostics["flow_cov_below_threshold_points"] = int(cov_pass.sum().item())
-            mask &= cov_finite
-            mask &= cov_pass
-            diagnostics["after_flow_cov"] = int(mask.sum().item())
-        else:
-            diagnostics["flow_cov_available"] = False
-            diagnostics["after_flow_cov"] = int(mask.sum().item())
-        if match.mask is not None:
-            match_mask = IFrontend.retrieve_pixels(candidate_uv, match.mask)
-            if match_mask is not None:
-                valid_match_mask = match_mask.squeeze(0).bool()
-                diagnostics["match_mask_available"] = True
-                diagnostics["match_mask_pass_points"] = int(valid_match_mask.sum().item())
-                mask &= valid_match_mask
-                diagnostics["after_match_mask"] = int(mask.sum().item())
-            else:
-                diagnostics["match_mask_available"] = False
-                diagnostics["after_match_mask"] = int(mask.sum().item())
-        else:
-            diagnostics["match_mask_available"] = False
-            diagnostics["after_match_mask"] = int(mask.sum().item())
-
-        candidate_uv = candidate_uv[mask]
-        current_uv = current_uv[mask]
-        flow_count = int(candidate_uv.size(0))
-        diagnostics["flow_points"] = flow_count
-        if flow_count == 0:
-            return "no valid flow correspondences", diagnostics
-
-        depth_map = historical.depth.to(device=device, dtype=torch.float32)
-        depth = IFrontend.retrieve_pixels(candidate_uv, depth_map)
-        if depth is None:
-            return "candidate depth is missing", diagnostics
-        depth = depth.squeeze(0)
-        depth_mask = torch.isfinite(depth) & (depth > 0.0)
-        diagnostics["valid_depth_after_flow_points"] = int(depth_mask.sum().item())
-        candidate_uv = candidate_uv[depth_mask]
-        current_uv = current_uv[depth_mask]
-        depth = depth[depth_mask]
-        diagnostics["geometry_points"] = int(candidate_uv.size(0))
-        if candidate_uv.size(0) == 0:
-            return "no valid candidate depths after flow filtering", diagnostics
-
-        K = historical.intrinsic.to(device=device, dtype=torch.float32)
-        frame_K = K[0] if K.ndim == 3 else K
-        points_ned = pixel2point_NED(candidate_uv, depth, frame_K).float()
-        points_cv = points_ned.roll(shifts=-1, dims=-1)
-        return candidate_uv.cpu(), current_uv.cpu(), points_ned.cpu(), _tensor_to_numpy(points_cv.float()), flow_count, diagnostics
 
     def _run_pnp(
         self,
@@ -463,12 +885,15 @@ class LoopCandidateVerifier:
         if object_points_cv.shape[0] < 4:
             return "not enough points for PnP"
         image_points_np = _tensor_to_numpy(image_points.float())
-        K = _tensor_to_numpy(current.intrinsic[0] if current.intrinsic.ndim == 3 else current.intrinsic).astype(np.float64)
+        K = _tensor_to_numpy(
+            current.intrinsic[0] if current.intrinsic.ndim == 3 else current.intrinsic
+        ).astype(np.float64)
+        dist_coeffs = np.empty((0, 1), dtype=np.float64)
         success, rvec, tvec, inliers = cv2.solvePnPRansac(
             object_points_cv.astype(np.float64),
             image_points_np.astype(np.float64),
             K,
-            None,
+            dist_coeffs,
             iterationsCount=int(getattr(pnp_cfg, "iterations", 100)),
             reprojectionError=float(getattr(pnp_cfg, "reproj_error_px", 3.0)),
             confidence=float(getattr(pnp_cfg, "confidence", 0.999)),
@@ -476,18 +901,22 @@ class LoopCandidateVerifier:
         )
         if not success or inliers is None or len(inliers) == 0:
             return "PnP RANSAC failed"
-        inliers = inliers.reshape(-1)
+        inliers = np.asarray(inliers, dtype=np.int64).reshape(-1)
+        inlier_indices = [int(index) for index in inliers]
         if bool(getattr(pnp_cfg, "refine", True)) and hasattr(cv2, "solvePnPRefineLM"):
             rvec, tvec = cv2.solvePnPRefineLM(
-                object_points_cv[inliers].astype(np.float64),
-                image_points_np[inliers].astype(np.float64),
+                object_points_cv[inlier_indices].astype(np.float64),
+                image_points_np[inlier_indices].astype(np.float64),
                 K,
-                None,
+                dist_coeffs,
                 rvec,
                 tvec,
             )
-        projected, _ = cv2.projectPoints(object_points_cv[inliers].astype(np.float64), rvec, tvec, K, None)
-        projected = projected.reshape(-1, 2)
-        errors = np.linalg.norm(projected - image_points_np[inliers], axis=1)
+        projected, _ = cv2.projectPoints(
+            object_points_cv[inlier_indices].astype(np.float64), rvec, tvec, K, dist_coeffs
+        )
+        errors = np.linalg.norm(
+            projected.reshape(-1, 2) - image_points_np[inlier_indices], axis=1
+        )
         mean_error = float(np.mean(errors)) if len(errors) > 0 else math.inf
         return _opencv_pose_to_ned_se3(rvec, tvec), mean_error, inliers
