@@ -18,6 +18,13 @@ from Module.Optimization.GlobalPGO import make_information
 from Utility.Point import filterPointsInRange, pixel2point_NED
 
 from .Record import LoopFrameRecord
+from .PhaseB5 import (
+    NMSSelection,
+    PhaseB5Analyzer,
+    _run_flow_pnp,
+    refine_and_information,
+    spatial_selection_indices,
+)
 
 
 @dataclass(frozen=True)
@@ -94,6 +101,8 @@ class PreparedCommon:
     covariance_gate_mask: torch.Tensor | None
     diagnostics: dict[str, Any]
     comparison_applicable: bool
+    phase_b5_row: dict[str, Any] | None = None
+    phase_b5_selection: NMSSelection | None = None
 
 
 @dataclass
@@ -225,9 +234,16 @@ def _pose_error(measured: pp.LieTensor, reference: pp.LieTensor) -> tuple[float,
 
 
 class LoopCandidateVerifier:
-    def __init__(self, config: SimpleNamespace, frontend: IFrontend) -> None:
+    def __init__(
+        self,
+        config: SimpleNamespace,
+        frontend: IFrontend,
+        phase_b5: PhaseB5Analyzer | None = None,
+    ) -> None:
         self.config = config
         self.frontend = frontend
+        self.phase_b5 = phase_b5
+        self.phase_b5_results: dict[str, tuple[VerificationRecord, LoopConstraint | None]] = {}
         self.frontend_inference_calls = 0
         self.candidates_reaching_frontend = 0
         self._aggregate_covariance: dict[str, list[torch.Tensor]] = {
@@ -267,6 +283,18 @@ class LoopCandidateVerifier:
         try:
             common = self._prepare_once(query, candidate, current, historical)
         except Exception as error:
+            if self.phase_b5 is not None and self.phase_b5.enabled:
+                pair_id = self._pair_id(query, candidate)
+                if not any(row.get("pair_id") == pair_id for row in self.phase_b5.rows):
+                    self.phase_b5.record_flow_failure(
+                        query, candidate,
+                        {
+                            "status": "not_computed",
+                            "reject_code": "common_preparation_exception",
+                            "orb_gate_pass": False,
+                        },
+                        "verification_exception", str(error),
+                    )
             common = CommonRejection("verification_exception", f"common preparation exception: {error}")
         if isinstance(common, CommonRejection):
             return {
@@ -286,6 +314,9 @@ class LoopCandidateVerifier:
                 for gate in gate_modes
             }
 
+        self._run_phase_b5_shadow(
+            pose_snapshot, query, candidate, current, historical, common, started
+        )
         results: dict[bool, tuple[VerificationRecord, LoopConstraint | None]] = {}
         for gate in gate_modes:
             try:
@@ -307,6 +338,95 @@ class LoopCandidateVerifier:
                     None,
                 )
         return results
+
+    def _run_phase_b5_shadow(
+        self,
+        pose_snapshot: torch.Tensor,
+        query: dict[str, Any],
+        candidate: dict[str, Any],
+        current: LoopFrameRecord,
+        historical: LoopFrameRecord,
+        common: PreparedCommon,
+        started: float,
+    ) -> None:
+        if self.phase_b5 is None or common.phase_b5_row is None:
+            return
+        pair_id = self._pair_id(query, candidate)
+        row = common.phase_b5_row
+        selection = common.phase_b5_selection
+        caps = (row.get("flow") or {}).get("point_risk_cap_by_population") or {}
+        row["selector_shadow_by_population"] = {}
+        row["refinement_by_population"] = {}
+        if selection is None:
+            row["selector_shadow_unavailable_reason"] = "selection_unavailable"
+            return
+        for population in row.get("populations", []):
+            point_cap = caps.get(population)
+            if point_cap is None:
+                row["selector_shadow_by_population"][population] = None
+                row["refinement_by_population"][population] = None
+                continue
+            capped_mask = selection.valid_mask & (selection.normalized_risk <= float(point_cap))
+            capped_selection = copy.copy(selection)
+            capped_selection.valid_mask = capped_mask
+            spatial_indices = spatial_selection_indices(
+                capped_selection, current,
+                getattr(self.phase_b5.config, "flow", SimpleNamespace()),
+            )
+            spatial_mask = torch.zeros_like(capped_mask)
+            spatial_mask[spatial_indices] = True
+            capped_selection.valid_mask = spatial_mask
+            nms_common = PreparedCommon(
+                candidate_uv=selection.candidate_uv,
+                current_uv=selection.current_uv,
+                original_indices=selection.original_indices,
+                depth=selection.depth,
+                depth_valid=spatial_mask,
+                match_mask=None,
+                covariance=selection.covariance,
+                covariance_gate_mask=None,
+                diagnostics={
+                    "frontend_type": type(self.frontend).__name__,
+                    "candidate_samples": int(selection.candidate_uv.shape[0]),
+                    "finite_flow_points": int(spatial_mask.sum()),
+                    "inbound_flow_points": int(spatial_mask.sum()),
+                    "after_inbound_and_finite": int(selection.candidate_uv.shape[0]),
+                    "covariance_available": True,
+                    "comparison_applicable": True,
+                    "covariance_statistics_mother_set": "dense_q_nms_points",
+                    "quantile_interpolation": "linear",
+                    "flow_cov_threshold": float("inf"),
+                    "phase_b5_selector": "q_nms_normalized_lambda_max_cap",
+                    "phase_b5_population": population,
+                    "phase_b5_point_risk_cap": float(point_cap),
+                },
+                comparison_applicable=True,
+            )
+            try:
+                verification, constraint = self._verify_branch(
+                    pose_snapshot, query, candidate, current, historical,
+                    nms_common, False, started,
+                )
+                assert verification.diagnostics is not None
+                verification.diagnostics["selection_mode"] = "phase_b5_q_nms_risk_cap"
+                row["selector_shadow_by_population"][population] = verification.to_dict()
+                self.phase_b5_results[f"{pair_id}|{population}"] = (verification, constraint)
+                row["refinement_by_population"][population] = None
+                if verification.pnp_ransac_succeeded and verification.pnp_relative_pose is not None:
+                    pnp_diag, pose, inlier_indices = _run_flow_pnp(
+                        capped_selection, current, historical,
+                        getattr(self.phase_b5.config, "flow", SimpleNamespace()),
+                    )
+                    row.setdefault("selector_shadow_pnp_detail_by_population", {})[population] = pnp_diag
+                    if pose is not None and inlier_indices is not None:
+                        row["refinement_by_population"][population] = refine_and_information(
+                            capped_selection, inlier_indices, pose, current, historical
+                        )
+            except Exception as error:
+                row["selector_shadow_by_population"][population] = {
+                    "status": "rejected", "reject_code": "verification_exception",
+                    "reject_reason": str(error),
+                }
 
     def _reject(
         self,
@@ -345,18 +465,52 @@ class LoopCandidateVerifier:
         current_sensor = int(query["sensor_frame_idx"])
         candidate_sensor = int(candidate["sensor_frame_idx"])
         if candidate_sensor >= current_sensor:
+            if self.phase_b5 is not None and self.phase_b5.enabled:
+                self.phase_b5.record_flow_failure(
+                    query, candidate,
+                    {"status": "not_computed", "reject_code": "common_rejection", "orb_gate_pass": False},
+                    "invalid_candidate_order", "candidate is not earlier than current frame",
+                )
             return CommonRejection("invalid_candidate_order", "candidate is not earlier than current frame")
         min_gap = int(getattr(self.config.geometric_verification, "min_sensor_gap", 100))
         if current_sensor - candidate_sensor < min_gap:
+            if self.phase_b5 is not None and self.phase_b5.enabled:
+                self.phase_b5.record_flow_failure(
+                    query, candidate,
+                    {"status": "not_computed", "reject_code": "common_rejection", "orb_gate_pass": False},
+                    "inside_min_gap", "candidate is inside min_sensor_gap",
+                )
             return CommonRejection("inside_min_gap", "candidate is inside min_sensor_gap")
 
         candidate_uv_cpu = self._sample_candidate_uv(historical)
         if candidate_uv_cpu.size(0) == 0:
+            if self.phase_b5 is not None and self.phase_b5.enabled:
+                try:
+                    orb = self.phase_b5.observe_orb(current, historical)
+                except Exception as error:
+                    orb = {
+                        "status": "rejected", "reject_code": "orb_observe_exception",
+                        "reject_reason": str(error), "orb_gate_pass": False,
+                    }
+                self.phase_b5.record_flow_failure(
+                    query, candidate, orb,
+                    "no_candidate_depth_pixels", "no valid candidate depth pixels",
+                )
             return CommonRejection(
                 "no_candidate_depth_pixels",
                 "no valid candidate depth pixels",
                 diagnostics={"candidate_samples": 0},
             )
+
+        phase_b5_orb: dict[str, Any] | None = None
+        if self.phase_b5 is not None and self.phase_b5.enabled:
+            try:
+                phase_b5_orb = self.phase_b5.observe_orb(current, historical)
+            except Exception as error:
+                phase_b5_orb = {
+                    "status": "rejected", "reject_code": "orb_observe_exception",
+                    "reject_reason": str(error), "orb_gate_pass": False,
+                }
 
         self.candidates_reaching_frontend += 1
         self.frontend_inference_calls += 1
@@ -365,11 +519,19 @@ class LoopCandidateVerifier:
                 historical.to_stereo_data(getattr(self.frontend.config, "device", "cpu")),
                 current.to_stereo_data(getattr(self.frontend.config, "device", "cpu")),
             )
-            del depth_current
         except Exception as error:
+            if self.phase_b5 is not None and phase_b5_orb is not None:
+                self.phase_b5.record_flow_failure(
+                    query, candidate, phase_b5_orb,
+                    "frontend_exception", str(error),
+                )
             return CommonRejection("verification_exception", f"frontend exception: {error}")
 
         if getattr(match, "flow", None) is None:
+            if self.phase_b5 is not None and phase_b5_orb is not None:
+                self.phase_b5.record_flow_failure(
+                    query, candidate, phase_b5_orb, "missing_flow", "flow is missing"
+                )
             return CommonRejection(
                 "missing_flow",
                 "flow is missing",
@@ -381,6 +543,11 @@ class LoopCandidateVerifier:
         candidate_uv = candidate_uv_cpu.to(device=device, dtype=torch.float32)
         flow = IFrontend.retrieve_pixels(candidate_uv, flow_map)
         if flow is None:
+            if self.phase_b5 is not None and phase_b5_orb is not None:
+                self.phase_b5.record_flow_failure(
+                    query, candidate, phase_b5_orb,
+                    "missing_flow", "flow sampling failed",
+                )
             return CommonRejection("missing_flow", "flow is missing")
         current_uv = candidate_uv + flow.T
         inbound = filterPointsInRange(
@@ -420,6 +587,11 @@ class LoopCandidateVerifier:
                 or covariance_map.shape[-2:] != flow_map.shape[-2:]
             ):
                 diagnostics["covariance_available"] = False
+                if self.phase_b5 is not None and phase_b5_orb is not None:
+                    self.phase_b5.record_flow_failure(
+                        query, candidate, phase_b5_orb,
+                        "invalid_covariance_layout", f"invalid covariance shape {tuple(covariance_map.shape)}",
+                    )
                 return CommonRejection(
                     "invalid_covariance_layout",
                     f"invalid covariance shape {tuple(covariance_map.shape)} for flow {tuple(flow_map.shape)}",
@@ -429,6 +601,11 @@ class LoopCandidateVerifier:
             sampled_covariance = IFrontend.retrieve_pixels(candidate_uv, covariance_map)
             if sampled_covariance is None:
                 diagnostics["covariance_available"] = False
+                if self.phase_b5 is not None and phase_b5_orb is not None:
+                    self.phase_b5.record_flow_failure(
+                        query, candidate, phase_b5_orb,
+                        "invalid_covariance_layout", "covariance sampling failed",
+                    )
                 return CommonRejection(
                     "invalid_covariance_layout",
                     "covariance sampling failed",
@@ -465,6 +642,11 @@ class LoopCandidateVerifier:
         depth_map = historical.depth.to(device=device, dtype=torch.float32)
         depth = IFrontend.retrieve_pixels(base_candidate_uv, depth_map)
         if depth is None:
+            if self.phase_b5 is not None and phase_b5_orb is not None:
+                self.phase_b5.record_flow_failure(
+                    query, candidate, phase_b5_orb,
+                    "missing_candidate_depth", "candidate depth is missing",
+                )
             return CommonRejection(
                 "missing_candidate_depth",
                 "candidate depth is missing",
@@ -473,6 +655,42 @@ class LoopCandidateVerifier:
             )
         depth = depth.squeeze(0)
         depth_valid = torch.isfinite(depth) & (depth > 0.0)
+
+        phase_b5_row: dict[str, Any] | None = None
+        phase_b5_selection: NMSSelection | None = None
+        if self.phase_b5 is not None and self.phase_b5.enabled:
+            try:
+                phase_b5_row, phase_b5_selection = self.phase_b5.observe(
+                    query, candidate, current, historical, match, depth_current,
+                    base_candidate_uv, base_current_uv, covariance, phase_b5_orb,
+                )
+                diagnostics["phase_b5_pair_id"] = phase_b5_row["pair_id"]
+            except Exception as error:
+                orb_for_row = phase_b5_orb or {
+                    "status": "not_computed", "reject_code": "orb_unavailable",
+                    "orb_gate_pass": False,
+                }
+                populations = ["all_bow_candidates"] + (
+                    ["orb_supported_candidates"] if orb_for_row.get("orb_gate_pass") else []
+                )
+                phase_b5_row = {
+                    "pair_id": self._pair_id(query, candidate),
+                    "current_sensor_frame_idx": current_sensor,
+                    "candidate_sensor_frame_idx": candidate_sensor,
+                    "bow_score": float(candidate.get("score", 0.0)),
+                    "status": "rejected",
+                    "reject_code": "phase_b5_observe_exception",
+                    "reject_reason": str(error),
+                    "orb": orb_for_row,
+                    "flow": {
+                        "pair_sanity_pass": False, "pair_gate_pass": None,
+                        "reject_code": "phase_b5_observe_exception",
+                        "reject_reason": str(error),
+                    },
+                    "populations": populations,
+                    "in_calibration_prefix": self.phase_b5.is_in_calibration(query),
+                }
+                self.phase_b5.rows.append(phase_b5_row)
 
         return PreparedCommon(
             candidate_uv=base_candidate_uv,
@@ -485,6 +703,8 @@ class LoopCandidateVerifier:
             covariance_gate_mask=covariance_gate_mask,
             diagnostics=diagnostics,
             comparison_applicable=comparison_applicable,
+            phase_b5_row=phase_b5_row,
+            phase_b5_selection=phase_b5_selection,
         )
 
     def _covariance_diagnostics(

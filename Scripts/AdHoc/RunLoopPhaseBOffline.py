@@ -227,8 +227,16 @@ def validate_comparison_outputs(output_dir: Path) -> dict[str, Any]:
         raise ValueError("main verification does not belong to the configured primary branch")
     if main.get("verifications") != selected_verification.get("verifications"):
         raise ValueError("main verification rows differ from the named primary branch")
-    if payloads["loop_constraints.json"] != selected_constraints:
+    phase_b5_apply = (
+        isinstance(main.get("phase_b5"), dict)
+        and main["phase_b5"].get("mode") == "apply"
+    )
+    if not phase_b5_apply and payloads["loop_constraints.json"] != selected_constraints:
         raise ValueError("main constraints differ from the named primary branch")
+    if phase_b5_apply:
+        cascade = _load_json(output_dir / "cascade_apply/constraints.json")
+        if payloads["loop_constraints.json"] != cascade:
+            raise ValueError("main constraints differ from the Phase B.5 apply branch")
 
     applicable = [
         pair_id
@@ -351,6 +359,13 @@ def _parse_args() -> argparse.Namespace:
         type=_positive_int,
         help="Covariance-stage minimum for gate-on; omit to reproduce the fixed threshold gate.",
     )
+    parser.add_argument(
+        "--phase-b5-mode", choices=("disabled", "observe", "apply"), default=None,
+        help="Phase B.5 mode; apply additionally requires a promoted trusted manifest.",
+    )
+    parser.add_argument("--phase-b5-manifest", type=Path)
+    parser.add_argument("--phase-b5-absolute-median-cap", type=float)
+    parser.add_argument("--phase-b5-absolute-q95-cap", type=float)
     return parser.parse_args()
 
 
@@ -375,6 +390,22 @@ def main() -> None:
     # Explicitly override the YAML so an omitted CLI option always means the fixed baseline.
     loop_config.geometry.flow_cov_adaptive_target_points = args.adaptive_target_points
     loop_config.geometric_verification.compare_flow_cov_gate = True
+    if hasattr(loop_config, "phase_b5"):
+        if args.phase_b5_mode is not None:
+            loop_config.phase_b5.enabled = args.phase_b5_mode != "disabled"
+            loop_config.phase_b5.mode = args.phase_b5_mode
+        if args.phase_b5_manifest is not None:
+            loop_config.phase_b5.trusted_manifest = str(args.phase_b5_manifest.resolve())
+            trusted_payload = _load_json(args.phase_b5_manifest.resolve())
+            caps = trusted_payload.get("absolute_sanity_caps") or {}
+            loop_config.phase_b5.calibration.absolute_median_log_risk_cap = caps.get("median_log_risk")
+            loop_config.phase_b5.calibration.absolute_q95_log_risk_cap = caps.get("q95_log_risk")
+        if args.phase_b5_absolute_median_cap is not None:
+            loop_config.phase_b5.calibration.absolute_median_log_risk_cap = args.phase_b5_absolute_median_cap
+        if args.phase_b5_absolute_q95_cap is not None:
+            loop_config.phase_b5.calibration.absolute_q95_log_risk_cap = args.phase_b5_absolute_q95_cap
+    elif args.phase_b5_mode not in {None, "disabled"} or args.phase_b5_manifest is not None:
+        raise ValueError("selected configuration has no phase_b5 section")
     frontend_config.args.device = args.device
     LoopClosureManager.is_valid_config(loop_config)
 
@@ -434,6 +465,13 @@ def main() -> None:
             records,
         ),
     }
+    if hasattr(loop_config, "phase_b5") and loop_config.phase_b5.mode == "apply":
+        gt_pose_proxy["phase_b5_apply"] = evaluate_gt_pose_proxy(
+            output_dir / "loop_constraints.json",
+            result_dir / "ref_poses.npy",
+            record_dir,
+            records,
+        )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(index_path, output_dir / "source_index.json")
@@ -453,6 +491,9 @@ def main() -> None:
             "manager": _sha256(
                 Path(__file__).resolve().parents[2] / "Module/LoopClosure/Manager.py"
             ),
+            "phase_b5": _sha256(
+                Path(__file__).resolve().parents[2] / "Module/LoopClosure/PhaseB5.py"
+            ),
             "offline_runner": _sha256(Path(__file__).resolve()),
             "config": _sha256(config_path),
         },
@@ -466,6 +507,25 @@ def main() -> None:
             "fixed" if args.adaptive_target_points is None else "adaptive"
         ),
         "adaptive_target_points": args.adaptive_target_points,
+        "phase_b5_mode": (
+            getattr(loop_config.phase_b5, "mode", "disabled")
+            if hasattr(loop_config, "phase_b5") else "disabled"
+        ),
+        "phase_b5_manifest": None if args.phase_b5_manifest is None else str(args.phase_b5_manifest),
+        "phase_b5_manifest_sha256": (
+            None if args.phase_b5_manifest is None else _sha256(args.phase_b5_manifest.resolve())
+        ),
+        "phase_b5_effective_calibration": (
+            None if not hasattr(loop_config, "phase_b5") else {
+                "prefix_fraction": loop_config.phase_b5.calibration.prefix_fraction,
+                "absolute_median_log_risk_cap": (
+                    loop_config.phase_b5.calibration.absolute_median_log_risk_cap
+                ),
+                "absolute_q95_log_risk_cap": (
+                    loop_config.phase_b5.calibration.absolute_q95_log_risk_cap
+                ),
+            }
+        ),
         "max_total_candidates": args.max_total_candidates,
         "selected_candidates": selected_candidates,
         "elapsed_seconds": elapsed_seconds,

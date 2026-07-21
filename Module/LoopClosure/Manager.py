@@ -29,6 +29,7 @@ from .Recognizer import (
     PlaceRecognitionBackend,
 )
 from .Record import LoopFrameRecord
+from .PhaseB5 import PhaseB5Analyzer
 from .Verification import LoopCandidateVerifier, LoopConstraint, has_required_pnp_functions
 
 
@@ -122,7 +123,7 @@ class LoopClosureManager(ConfigTestable):
                 raise ValueError(f"Config does not match specification! ({key}={getattr(config, key)!r})")
         excessive = set(vars(config)) - (
             set(base_spec) | set(optional_base)
-            | {"geometric_verification", "geometry", "pnp", "verification", "loop_information"}
+            | {"geometric_verification", "geometry", "pnp", "verification", "loop_information", "phase_b5"}
         )
         if excessive:
             raise KeyError(f"Excessive Keys: {excessive} from {list(base_spec)}")
@@ -171,6 +172,43 @@ class LoopClosureManager(ConfigTestable):
             _validate_section(config.loop_information, {
                 "trans_weight": lambda value: _is_number(value, lambda item: item > 0.0),
                 "rot_weight": lambda value: _is_number(value, lambda item: item > 0.0),
+            })
+        if hasattr(config, "phase_b5"):
+            _validate_section(
+                config.phase_b5,
+                {
+                    "enabled": lambda value: isinstance(value, bool),
+                    "mode": lambda value: value in {"disabled", "observe", "apply"},
+                    "calibration": lambda value: isinstance(value, SimpleNamespace),
+                    "orb": lambda value: isinstance(value, SimpleNamespace),
+                    "flow": lambda value: isinstance(value, SimpleNamespace),
+                },
+                {"trusted_manifest": lambda value: value is None or isinstance(value, str)},
+            )
+            _validate_section(config.phase_b5.calibration, {
+                "prefix_fraction": lambda value: _is_number(value, lambda item: 0.0 < item < 1.0),
+                "min_queries": lambda value: _is_int(value, lambda item: item > 0),
+                "min_all_bow_pairs": lambda value: _is_int(value, lambda item: item > 0),
+                "min_orb_pairs": lambda value: _is_int(value, lambda item: item > 0),
+                "absolute_median_log_risk_cap": lambda value: value is None or _is_number(value, math.isfinite),
+                "absolute_q95_log_risk_cap": lambda value: value is None or _is_number(value, math.isfinite),
+            })
+            _validate_section(config.phase_b5.orb, {
+                "ratio": lambda value: _is_number(value, lambda item: 0.0 < item < 1.0),
+                "max_depth": lambda value: _is_number(value, lambda item: item > 0.0),
+            })
+            _validate_section(config.phase_b5.flow, {
+                "min_valid_points": lambda value: _is_int(value, lambda item: item >= 4),
+                "min_valid_ratio": lambda value: _is_number(value, lambda item: 0.0 <= item <= 1.0),
+                "min_grid_cells": lambda value: _is_int(value, lambda item: item > 0),
+                "nms_kernel_size": lambda value: _is_int(value, lambda item: item > 0 and item % 2 == 1),
+                "border": lambda value: _is_int(value, lambda item: item >= 0),
+                "min_points": lambda value: _is_int(value, lambda item: item >= 4),
+                "max_points": lambda value: _is_int(value, lambda item: item > 0),
+                "max_depth": lambda value: _is_number(value, lambda item: item > 0.0),
+                "grid_rows": lambda value: _is_int(value, lambda item: item > 0),
+                "grid_cols": lambda value: _is_int(value, lambda item: item > 0),
+                "max_points_per_cell": lambda value: _is_int(value, lambda item: item > 0),
             })
 
     def set_frontend(self, frontend: IFrontend) -> None:
@@ -534,6 +572,7 @@ class LoopClosureManager(ConfigTestable):
         try:
             for filename, payload in payloads:
                 target = self.output_dir / filename
+                target.parent.mkdir(parents=True, exist_ok=True)
                 temporary = target.with_name(f"{target.name}.{comparison_run_id}.tmp")
                 with open(temporary, "w", encoding="utf-8") as file:
                     json.dump(_json_safe(payload), file, indent=2, allow_nan=False)
@@ -574,7 +613,13 @@ class LoopClosureManager(ConfigTestable):
         record_root = self.output_dir if record_dir is None else Path(record_dir)
         if not record_root.is_dir():
             raise RuntimeError(f"loop-frame record directory does not exist: {record_root}")
-        verifier = LoopCandidateVerifier(self.config, self.frontend)
+        phase_b5 = None
+        phase_b5_config = getattr(self.config, "phase_b5", None)
+        if bool(getattr(phase_b5_config, "enabled", False)) and getattr(phase_b5_config, "mode", "disabled") != "disabled":
+            phase_b5 = PhaseB5Analyzer(
+                self.config.phase_b5, queries, self.records, record_root
+            )
+        verifier = LoopCandidateVerifier(self.config, self.frontend, phase_b5)
         primary_gate_enabled = self.primary_flow_cov_gate_enabled(self.config)
         comparison_enabled = self.flow_cov_comparison_enabled(self.config)
         gate_modes = [True, False] if comparison_enabled else [primary_gate_enabled]
@@ -638,7 +683,7 @@ class LoopClosureManager(ConfigTestable):
 
         def verification_payload(gate: bool) -> dict[str, Any]:
             payload: dict[str, Any] = {
-                "schema_version": 2,
+                "schema_version": 3,
                 "comparison_run_id": comparison_run_id,
                 "primary_gate_enabled": primary_gate_enabled,
                 "comparison_enabled": comparison_enabled,
@@ -672,13 +717,120 @@ class LoopClosureManager(ConfigTestable):
                 ("loop_verification_gate_disabled.json", verification_payload(False)),
             ])
         payloads.append(("loop_constraints.json", constraint_payload(primary_gate_enabled)))
-        payloads.append(("loop_verification.json", verification_payload(primary_gate_enabled)))
+        phase_b5_primary_constraints: list[LoopConstraint] | None = None
+        if phase_b5 is not None:
+            # A replay with a trusted/intermediate manifest must publish the exact
+            # effective thresholds and promotion stage that produced its branches.
+            calibration_manifest = (
+                phase_b5.calibration_manifest()
+                if phase_b5.manifest is None
+                else json.loads(json.dumps(phase_b5.manifest))
+            )
+            calibration_manifest["comparison_run_id"] = comparison_run_id
+            payloads.append(("phase_b5_calibration_manifest.json", calibration_manifest))
+            for filename, payload in phase_b5.branch_payloads().items():
+                payload["comparison_run_id"] = comparison_run_id
+                payloads.append((filename, payload))
+            if phase_b5.mode == "apply":
+                phase_b5_primary_constraints = []
+                cascade_rows: list[dict[str, Any]] = []
+                orb_promoted = bool(phase_b5.manifest and phase_b5.manifest.get("orb_promoted") is True)
+                promoted_population = str(
+                    (phase_b5.manifest or {}).get("promoted_population", "all_bow_candidates")
+                )
+                for row in phase_b5.rows:
+                    pair_id = str(row["pair_id"])
+                    sensor_pair = (
+                        int(row["current_sensor_frame_idx"]),
+                        int(row["candidate_sensor_frame_idx"]),
+                    )
+                    forced_control = sensor_pair in {
+                        (1200, 1100), (1250, 470), (1250, 480),
+                    }
+                    orb_pass = bool((row.get("orb") or {}).get("orb_gate_pass"))
+                    preferred_population = promoted_population
+                    pair_pass = bool(
+                        ((row.get("flow") or {}).get("pair_gate_by_population") or {}).get(preferred_population)
+                    )
+                    if preferred_population == "orb_supported_candidates" and (not orb_promoted or not orb_pass):
+                        pair_pass = False
+                    selector = (row.get("selector_shadow_by_population") or {}).get(preferred_population) or {}
+                    result = verifier.phase_b5_results.get(f"{pair_id}|{preferred_population}")
+                    accepted = bool(
+                        not forced_control
+                        and pair_pass
+                        and selector.get("status") == "accepted"
+                        and result is not None
+                        and result[1] is not None
+                    )
+                    cascade_rows.append({
+                        "pair_id": pair_id,
+                        "population": preferred_population,
+                        "forced_control_shadow": forced_control,
+                        "pair_gate_pass": pair_pass,
+                        "selector_accepted": selector.get("status") == "accepted",
+                        "accepted": accepted,
+                    })
+                    if accepted:
+                        assert result is not None and result[1] is not None
+                        phase_b5_primary_constraints.append(result[1])
+                payloads.extend([
+                    ("cascade_apply/verification.json", {
+                        "schema_version": 1,
+                        "branch_id": "cascade_apply",
+                        "comparison_run_id": comparison_run_id,
+                        "rows": cascade_rows,
+                    }),
+                    ("cascade_apply/constraints.json", {
+                        "schema_version": 1,
+                        "pose_direction": "relative_pose = T_candidate_current = inverse(T_current_candidate)",
+                        "constraints": [item.to_dict() for item in phase_b5_primary_constraints],
+                    }),
+                ])
+                # In apply mode the standard constraint output and return value both
+                # belong to the promoted Phase B.5 branch. Named gate files remain
+                # legacy diagnostics.
+                for index, (filename, _) in enumerate(payloads):
+                    if filename == "loop_constraints.json":
+                        payloads[index] = ("loop_constraints.json", {
+                            "schema_version": 1,
+                            "pose_direction": "relative_pose = T_candidate_current = inverse(T_current_candidate)",
+                            "constraints": [item.to_dict() for item in phase_b5_primary_constraints],
+                        })
+                        break
+        # The main verification file is replaced last and acts as the run-completion marker.
+        main_verification = verification_payload(primary_gate_enabled)
+        if phase_b5 is not None:
+            main_verification["phase_b5"] = {
+                "enabled": True,
+                "mode": phase_b5.mode,
+                "schema_version": 1,
+                "pose_invariant": True,
+                "calibration_manifest": "phase_b5_calibration_manifest.json",
+                "branch_ids": [
+                    "orb_observe", "flow_all_bow_observe",
+                    "flow_orb_supported_observe", "forced_control_shadow",
+                ] + (["cascade_apply"] if phase_b5.mode == "apply" else []),
+            }
+            main_verification["primary_pipeline"] = (
+                "phase_b5_apply" if phase_b5.mode == "apply" else "legacy_phase_b"
+            )
+            main_verification["phase_b5"]["primary_constraint_count"] = (
+                None if phase_b5_primary_constraints is None
+                else len(phase_b5_primary_constraints)
+            )
+        payloads.append(("loop_verification.json", main_verification))
         self._write_json_bundle(payloads, comparison_run_id)
 
         primary_rows = verification_rows[primary_gate_enabled]
         primary_constraints = constraints[primary_gate_enabled]
+        returned_constraints = (
+            primary_constraints if phase_b5_primary_constraints is None
+            else phase_b5_primary_constraints
+        )
+        pipeline_name = "legacy Phase B" if phase_b5_primary_constraints is None else "Phase B.5 apply"
         Logger.write(
             "info",
-            f"Loop geometric verification accepted {len(primary_constraints)} / {len(primary_rows)} candidates.",
+            f"{pipeline_name} accepted {len(returned_constraints)} / {len(primary_rows)} candidates.",
         )
-        return primary_constraints
+        return returned_constraints

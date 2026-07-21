@@ -11,6 +11,7 @@ from DataLoader import StereoData
 
 from Utility.Extensions import ConfigTestableSubclass
 from Utility.Timer import Timer
+from Utility.Selection import local_minimum_nms
 
 
 
@@ -291,13 +292,7 @@ class CovAwareSelector(IKeypointSelector):
             quality_map *= flow_cov_map
         
         # Apply NMS on quality map
-        quality_map_erode = -torch.nn.functional.max_pool2d(
-            -quality_map,
-            kernel_size=self.config.kernel_size,
-            stride=1,
-            padding=(self.config.kernel_size // 2),
-        )
-        quality_nms = torch.logical_and(quality_map == quality_map_erode, ~quality_map.isnan())
+        quality_nms = local_minimum_nms(quality_map, self.config.kernel_size)
         
         # Positions that are not too close to the edge of image
         border_mask = torch.zeros_like(quality_nms, dtype=torch.bool)
@@ -382,13 +377,7 @@ class CovAwareSelector_NoDepth(IKeypointSelector):
         flow_cov_map = quality_map
         
         # Apply NMS on quality map
-        quality_map_erode = -torch.nn.functional.max_pool2d(
-            -quality_map,
-            kernel_size=self.config.kernel_size,
-            stride=1,
-            padding=(self.config.kernel_size // 2),
-        )
-        quality_nms = torch.logical_and(quality_map == quality_map_erode, ~quality_map.isnan())
+        quality_nms = local_minimum_nms(quality_map, self.config.kernel_size)
         
         # Positions that are not too close to the edge of image
         border_mask = torch.zeros_like(quality_nms, dtype=torch.bool)

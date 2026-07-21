@@ -623,7 +623,7 @@ def test_manager_writes_paired_strict_outputs_and_preserves_pose(
     primary = json.loads((output_dir / "loop_verification.json").read_text(encoding="utf-8"))
     enabled = json.loads((output_dir / "loop_verification_gate_enabled.json").read_text(encoding="utf-8"))
     disabled = json.loads((output_dir / "loop_verification_gate_disabled.json").read_text(encoding="utf-8"))
-    assert primary["schema_version"] == 2
+    assert primary["schema_version"] == 3
     assert primary["branch_gate_enabled"] is False
     assert primary["frontend_inference_calls"] == primary["candidates_reaching_frontend"] == 1
     assert primary["comparison_summary"]["pair_count"] == 1
@@ -662,3 +662,64 @@ def test_compare_disabled_only_writes_primary_files(monkeypatch: pytest.MonkeyPa
     payload = json.loads((output_dir / "loop_verification.json").read_text(encoding="utf-8"))
     assert payload["comparison_enabled"] is False
     assert "comparison_summary" not in payload
+
+
+def test_phase_b5_observe_writes_isolated_branches_without_extra_frontend_calls(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = make_config(tmp_path, gate=False, compare=True)
+    config.phase_b5 = SimpleNamespace(
+        enabled=True,
+        mode="observe",
+        trusted_manifest=None,
+        calibration=SimpleNamespace(
+            prefix_fraction=0.2, min_queries=20, min_all_bow_pairs=100,
+            min_orb_pairs=30, absolute_median_log_risk_cap=None,
+            absolute_q95_log_risk_cap=None,
+        ),
+        orb=SimpleNamespace(ratio=0.8, max_depth=20.0),
+        flow=SimpleNamespace(
+            min_valid_points=4, min_valid_ratio=0.0, min_grid_cells=1,
+            nms_kernel_size=3, border=0, min_points=4, max_points=16,
+            max_depth=20.0, grid_rows=2, grid_cols=2, max_points_per_cell=4,
+        ),
+    )
+    LoopClosureManager.is_valid_config(config)
+    manager = LoopClosureManager(config)
+    output_dir = tmp_path / "loop_closure"
+    record_dir = tmp_path / "cache"
+    manager.set_output_dir(output_dir)
+    current = make_record(200, 1, 1)
+    historical = make_record(100, 0, 0)
+    (record_dir / "frames").mkdir(parents=True)
+    historical.save(record_dir / "frames/historical.pt")
+    current.save(record_dir / "frames/current.pt")
+    manager.records = [
+        {"loop_frame_idx": 0, "sensor_frame_idx": 100, "file": "frames/historical.pt"},
+        {"loop_frame_idx": 1, "sensor_frame_idx": 200, "file": "frames/current.pt"},
+    ]
+    frontend = FakeFrontend(make_match(covariance_map()))
+    manager.set_frontend(frontend)  # type: ignore[arg-type]
+    monkeypatch.setattr(LoopCandidateVerifier, "_sample_candidate_uv", lambda self, _: fixed_points())
+    query, candidate = query_and_candidate()
+    manager.verify_candidates(
+        make_visual_map(), [{**query, "candidates": [candidate]}], record_dir=record_dir
+    )
+    assert frontend.calls == 1
+    assert (output_dir / "orb_observe/verification.json").is_file()
+    assert (output_dir / "flow_all_bow_observe/verification.json").is_file()
+    assert (output_dir / "flow_orb_supported_observe/verification.json").is_file()
+    assert (output_dir / "forced_control_shadow/verification.json").is_file()
+    orb_branch = json.loads(
+        (output_dir / "orb_observe/verification.json").read_text(encoding="utf-8")
+    )
+    assert len(orb_branch["rows"]) == 1
+    assert orb_branch["rows"][0]["pair_id"] == "1:0"
+    calibration = json.loads(
+        (output_dir / "phase_b5_calibration_manifest.json").read_text(encoding="utf-8")
+    )
+    assert calibration["prefix_query_count"] == 1
+    assert calibration["populations"]["all_bow_candidates"]["trusted"] is False
+    main = json.loads((output_dir / "loop_verification.json").read_text(encoding="utf-8"))
+    assert main["phase_b5"]["mode"] == "observe"
+    assert main["phase_b5"]["pose_invariant"] is True

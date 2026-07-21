@@ -122,5 +122,34 @@ Odometry:
       trans_weight: 1.0
       rot_weight: 1.0
 
+    # Phase B.5 is diagnostics-only until a reviewed calibration manifest is promoted.
+    phase_b5:
+      enabled: true
+      mode: observe               # disabled | observe | apply
+      trusted_manifest: null
+      calibration:
+        prefix_fraction: 0.2
+        min_queries: 20
+        min_all_bow_pairs: 100
+        min_orb_pairs: 30
+        # Freeze these on the development sequence before any apply run.
+        absolute_median_log_risk_cap: null
+        absolute_q95_log_risk_cap: null
+      orb:
+        ratio: 0.8
+        max_depth: 20.0
+      flow:
+        min_valid_points: 30
+        min_valid_ratio: 0.8
+        min_grid_cells: 8
+        nms_kernel_size: 7
+        border: 8
+        min_points: 30
+        max_points: 800
+        max_depth: 20.0
+        grid_rows: 8
+        grid_cols: 8
+        max_points_per_cell: 20
+
 Data: !include ../../Sequence/TartanAir_example.yaml
 Preprocess: !include ../Common/Preprocess.yaml

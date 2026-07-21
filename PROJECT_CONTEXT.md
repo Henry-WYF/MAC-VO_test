@@ -1,8 +1,8 @@
 # MAC-VO 工作上下文与交接记录
 
-> 类型：持续维护的项目“活文档”，用于新 Agent 接手、跨对话恢复上下文和记录关键决策。
+> 类型：持续维护的项目活文档，用于新 Agent 快速接手和记录已冻结决策。
 >
-> 最后更新：2026-07-15。
+> 最后更新：2026-07-21。
 >
 > 证据标签：`[代码已核验]`、`[论文信息]`、`[实验观察]`、`[设计计划]`、`[待验证]`、`[已废弃]`。
 
@@ -12,288 +12,206 @@
 |---|---|
 | 活动代码库 | `MAC-VO-test` |
 | GitHub | `https://github.com/Henry-WYF/MAC-VO_test.git` |
-| 当前分支 / HEAD | `agent-a-codex/loop-geometric-verification` / `a81b56d` |
-| 稳定主线 | `origin/main` / `7b65afe`；已包含本地 GlobalPGO，不是纯上游 MAC-VO |
-| 当前阶段 | 阶段 B 自适应 covariance 补点已实现并通过回归；等待服务器四档 CUDA 离线实验，阶段 C 尚未接入 |
-| 当前唯一优先事项 | 在同一缓存上运行 fixed/null、adaptive 50/100/200，并按冻结的 GT 位姿代理选择下一轮候选配置 |
-| 当前结论 | 固定阈值 `100` 是严重的直接阻断项，但 covariance 筛选仍有质量作用；gate-off 不能作为最终方案 |
+| 当前分支 / HEAD | `agent-a-codex/loop-geometric-verification` / `00ac6b2` |
+| 稳定主线 | `origin/main` / `7b65afe`；已含本地 GlobalPGO，并非纯上游 MAC-VO |
+| 当前阶段 | Phase A/B 已实现；Phase B.5 只读实现已落地，待服务器 pytest 与离线 observe/calibration/evaluation 验证 |
+| 当前后端 | 地点检索继续使用 `custom_binary`；DBoW2 仅保留为消融后端 |
+| 当前唯一优先事项 | 完成不确定性感知的回环帧对 veto、点选择、`PnP → reprojection+disparity` 验证和 6×6 information 诊断 |
+| 当前边界 | Phase B.5 不修改 VO 轨迹、不接入 GlobalPGO；通过准入条件后才实施 Phase C |
 | 禁止参考 | `MAC-VO-test_loop`，它是已废弃的早期回环尝试 |
 
-新 Agent 开始修改前必须先执行 `git status --short --branch`。审阅本文件时，工作区还存在用户所有的未提交改动（包括删除的“修改反馈.txt”以及未跟踪文档）；不得擅自恢复、覆盖或一并提交。
+新 Agent 修改前必须先执行 `git status --short --branch`。当前工作区含用户所有的未提交改动；不得擅自恢复、覆盖或一并提交。
 
-## 1. 原项目、论文与研究背景
+## 1. 研究目标与事实来源
 
-### 1.1 MAC-VO 论文信息
+`[论文信息]` 上游项目论文为 **MAC-VO: Metrics-aware Covariance for Learning-based Stereo Visual Odometry**（ICRA 2025）。
 
-`[论文信息]` MAC-VO 发表在 **ICRA 2025**，论文题目为：
+- 预印本：<https://arxiv.org/abs/2409.09479>
+- 官方主页：<https://mac-vo.github.io/>
 
-> **MAC-VO: Metrics-aware Covariance for Learning-based Stereo Visual Odometry**
-
-检索入口：
-
-- 论文预印本：<https://arxiv.org/abs/2409.09479>
-- 官方项目主页：<https://mac-vo.github.io/>
-- 建议检索词：`MAC-VO ICRA 2025 metrics-aware covariance stereo visual odometry`
-
-论文和官方资料用于理解作者动机、消融与算法选择；本地实现行为仍必须以当前分支的代码、配置和测试为准。
-
-### 1.2 总体研究计划
-
-目标不是简单“给 MAC-VO 加一个回环检测器”，而是在保持其度量感知不确定性优势的前提下形成完整闭环：
+长期目标不是简单添加回环检测器，而是构建：
 
 ```text
 MAC-VO 顺序里程计
-→ 地点识别与几何验证
-→ 非相邻回环相对位姿约束
-→ Global Pose Graph Optimization
+→ 地点识别
+→ 不确定性感知的跨时刻几何验证
+→ 带 6×6 information 的非相邻回环边
+→ robust GlobalPGO
 → 将累计漂移分摊到整条轨迹
-→ 进一步研究 covariance-aware 回环权重
 ```
 
-原始计划先完成最小 GlobalPGO，因为回环检测只能发现约束，不能自行修改轨迹；第一版后端只需节点、顺序边、回环边和固定信息矩阵。基础闭环稳定后，再将 MAC-VO covariance、几何验证质量和内点数量融合为不确定性感知权重。
+论文叙事候选为：**面向学习式双目视觉里程计的不确定性感知回环约束与全局优化**。本项目暂不引入紧耦合 IMU。
 
-长期论文叙事为：**面向学习式双目视觉里程计的不确定性感知回环约束与全局后端优化**。第一阶段不引入紧耦合 IMU，以避免时间同步、外参、bias、重力初始化、预积分和滑窗优化导致研究范围失控。
+事实优先级：当前分支源码与测试 > 本次运行保存的配置/结果 > 论文与官方资料 > 设计文档 > 历史讨论。无法确认的内容必须标为 `[待验证]`。
 
-原始总体计划文件：[`计划建议.txt`](C:\Users\lenovo\Desktop\code\SLAM\MAC-VO\计划建议.txt)。该文件记录最初动机；本文件记录其当前实施状态。
+## 2. 原系统与本地扩展
 
-## 2. 代码范围与事实来源
-
-| 路径/材料 | 定位 |
-|---|---|
-| `MAC-VO-main` | 原始项目目录，供上游基线对照 |
-| `MAC-VO-test` | 唯一活动实现，包含 GlobalPGO 与阶段 A/B 回环扩展 |
-| GitHub `main` | 当前稳定集成线，已经包含 GlobalPGO；不要等同于纯上游代码 |
-| `MAC-VO-test_loop` | `[已废弃]`，不得作为设计或实现参考 |
-| `ARCHITECTURE.md` | 历史线索，不是事实来源；内容必须重新由代码核验 |
-| `MACVO_SYSTEM_GUIDE.md` | 辅助系统导读，仍应与当前代码交叉核验 |
-| `AGENT_SYNC_GUIDE.md` | Git/GitHub 与多 Agent 协作的权威规则 |
-
-事实优先级：当前分支源码与测试 > 本次运行保存的配置/结果 > 论文与官方资料 > 设计文档 > 历史讨论。无法确认的内容必须标为 `[待验证]`，不得写成代码事实。
-
-## 3. 多 Agent Git/GitHub 协作（P0）
-
-### 3.1 身份、远端与分支
-
-三名 Agent 共用仓库 `Henry-WYF/MAC-VO_test`，通过分支名前缀区分：
-
-| Agent | 分支前缀 |
-|---|---|
-| A1：电脑 A 的 Codex | `agent-a-codex/` |
-| A2：电脑 A 的 ClaudeCode | `agent-a-claude/` |
-| B1：电脑 B 的 Codex | `agent-b-codex/` |
-
-当前已知提交链：
-
-| 分支/提交 | 内容 |
-|---|---|
-| `main` / `7b65afe` | GlobalPGO 修复、测试和稳定主线 |
-| `agent-a-codex/loop-place-recognition` / `d464bcc` | 阶段 A：ORB-BoW 地点召回 |
-| `agent-a-codex/loop-geometric-verification` / `648ff73` | 阶段 B：Flow/PnP 几何验证 |
-| 同上 / `645ae11` | 阶段 B 诊断日志增强，当前 HEAD |
-
-### 3.2 每次工作的标准流程
-
-新任务默认从最新 `main` 创建分支；若用户明确要求继续当前阶段分支，则先拉取该远端分支。任何情况下都先保护工作区：
-
-```bash
-git status --short --branch
-git diff
-git remote -v
-git fetch origin
-```
-
-从稳定主线开始新任务：
-
-```bash
-git checkout main
-git pull --ff-only origin main
-git checkout -b agent-name/task-name
-```
-
-保存阶段性成果：
-
-```bash
-git status
-git diff
-git add <仅与当前任务相关的文件>
-git commit -m "清晰、具体的任务摘要"
-git push -u origin agent-name/task-name
-```
-
-同步主线变化：
-
-```bash
-git fetch origin
-git checkout agent-name/task-name
-git merge origin/main
-```
-
-冲突必须人工检查并运行相关测试；不得用 `reset --hard`、`checkout -- .`、`clean -fd`、强制推送或覆盖其他 Agent 改动来消除冲突。功能分支通过 PR 合入 `main`，不要直接在 `main` 开发。
-
-交接必须包含：分支、提交、改动文件、完成内容、验证、已知问题、下一步，并同步更新本文件。完整规则见 [`AGENT_SYNC_GUIDE.md`](./AGENT_SYNC_GUIDE.md)。
-
-### 3.3 GitHub 网络代理
-
-用户确认电脑 A 的项目代理端口为：
+`[代码已核验]` MAC-VO 是学习式双目 VO，不是原生完整 SLAM。默认链路为：
 
 ```text
-127.0.0.1:7898
+双目预处理
+→ FlowFormerCov 输出视差、相邻帧光流及 covariance
+→ covariance-aware 选点和 2D→3D covariance 传播
+→ VisualMap 注册
+→ TwoFrame_PGO 优化当前帧
+→ 后处理和轨迹输出
 ```
-
-执行 `fetch/pull/push` 前先检查：
-
-```powershell
-Test-NetConnection 127.0.0.1 -Port 7898
-git config --show-origin --get-regexp "^(http|https)\..*proxy|^(http|https)\.proxy"
-```
-
-需要仓库级代理时：
-
-```powershell
-git config --local http.proxy  http://127.0.0.1:7898
-git config --local https.proxy http://127.0.0.1:7898
-git ls-remote origin
-```
-
-`[实验观察]` 2026-07-13 审阅时，当前仓库级配置仍指向 `7897`，全局 Git 配置指向 `33210`，而 `7898` 未监听。因此下一次联网前必须先确认代理程序实际端口并统一配置，不能假设文档值已经在本机生效。`127.0.0.1` 只代表当前机器；电脑 B 必须检查自己的代理，不能直接复用电脑 A 的回环地址。
-
-## 4. MAC-VO 原始系统概览
-
-`[代码已核验]` MAC-VO 是学习式双目视觉里程计，不是原生完整 SLAM。默认主链路为：
-
-```text
-双目帧预处理
-→ FlowFormerCov 估计当前帧双目视差、相邻帧光流及其协方差
-→ covariance-aware 选点、深度与 2D→3D 协方差传播
-→ VisualMap 注册帧、匹配和地图点
-→ TwoFrame_PGO 局部优化当前帧
-→ 后处理与轨迹/张量地图输出
-```
-
-主要入口和职责：
 
 | 位置 | 职责 |
 |---|---|
-| `MACVO.py` | 加载实验/数据配置、创建系统、运行、保存与评估 |
-| `Odometry/MACVO.py` | 编排前端、选点、地图注册、TwoFrame 和终止流程 |
-| `Module/Frontend/` | 深度、光流和学习式协方差 |
-| `Module/Map/` | `VisualMap` 的帧、匹配、点和索引关系 |
-| `Module/Optimization/TwoFramePGO/` | 当前帧局部几何优化 |
-| `Module/Optimization/GlobalPGO/` | 本地新增的全局位姿图扩展，不属于原论文实现 |
+| `MACVO.py` | 配置、运行、保存与评估入口 |
+| `Odometry/MACVO.py` | 前端、选点、地图、TwoFrame 和终止流程编排 |
+| `Module/Frontend/` | 深度、光流和学习式 covariance |
+| `Module/Covariance/Project2to3.py` | 像素/视差不确定性向 3D 点 covariance 传播 |
+| `Module/Optimization/TwoFramePGO/` | `icp/reproj/disp` 局部位姿优化；默认使用 `disp` |
+| `Module/LoopClosure/` | 本地 Phase A/B 回环扩展 |
+| `Module/Optimization/GlobalPGO/` | 本地全局位姿图扩展，不属于原论文实现 |
 
-默认 `TwoFrame_PGO` 只优化当前帧，不能消化历史帧间的非相邻回环边。项目几何使用左目 sensor pose；最终输出涉及的 body/sensor 外参转换不得提前混入回环边或 GlobalPGO。
+`TwoFrame_PGO` 默认只优化当前帧，不能消化历史非相邻回环。GlobalPGO 已具备节点、顺序边和 `add_loop_edge()` 接口；没有可靠回环边时基本是 no-op。
 
-## 5. 本地扩展、阶段计划与低侵入边界
+## 3. 阶段、状态与低侵入边界
 
-### 5.1 GlobalPGO
+| 阶段 | 工作 | 改变轨迹 | 状态 |
+|---|---|---:|---|
+| A | ORB-BoW 缓存与因果历史检索 | 否 | 已实现；`custom_binary` 保留，DBoW2 未晋升 |
+| B | FlowFormerCov 跨时刻匹配、PnP、诊断与 `LoopConstraint` | 否 | 已实现 |
+| B.5 | 自适应帧对 veto、点选择、`reproj+disp` 精化、6×6 information 诊断 | 否 | 当前唯一开发阶段 |
+| C | 回环边接入 GlobalPGO、Huber、安全检查和轨迹写回 | 是 | 未开始 |
+| D | 多数据集、消融、性能和论文评估 | 视配置 | 未开始 |
 
-`[代码已核验]` `GlobalPoseGraphOptimizer` 在 `terminate()` 阶段可选运行：节点为有效帧，顺序边来自相邻位姿，首帧固定，并预留 `add_loop_edge()`。当图中只有由同一初始轨迹生成的顺序边时，初始残差接近零，因此优化近似 no-op；它必须获得可靠回环边才可能修正漂移。
+低侵入原则：
 
-### 5.2 阶段 A–D
+- 允许配置启停、低频缓存、`terminate()` 离线检索/验证和独立离线重放。
+- 不改变原 `run_pair`、TwoFrame 优化和地图注册语义。
+- Phase A/B/B.5 不写回 `VisualMap.pose`，不调用 `GlobalPGO.add_loop_edge()`。
+- 回环模块失败只禁用回环；原 VO 必须继续完成。
+- CUDA 完整实验在远程服务器 Docker 中运行；本地负责代码、CPU/可运行 pytest 和结果分析。
 
-| 阶段 | 工作 | 主要产物 | 改变轨迹 | 状态 |
-|---|---|---|---|---|
-| A | ORB-BoW、低频缓存、因果历史检索 | `queries.json`、缓存帧 | 否 | 已实现并完成首轮正确性检查 |
-| B | FlowFormerCov 跨时刻匹配、候选深度、PnP、几何验证 | `loop_verification.json`、`LoopConstraint` | 否 | 已实现，当前正在诊断 |
-| C | 可信回环边接入 GlobalPGO、Huber、安全检查和写回 | 优化轨迹 | 是 | 未开始 |
-| D | 参数/模块消融、多数据集与性能分析 | 论文表格和曲线 | 视配置 | 未开始 |
+## 4. 已锁定的坐标与接口契约
 
-### 5.3 低侵入约束
+- ORB 仅用于地点识别，不参与原 MAC-VO 前端位姿计算。
+- BoW 离线数据库按 `sensor_frame_idx` 从空状态回放；先查历史、后插当前，禁止未来帧泄漏。
+- Phase B 调用 `estimate_pair(candidate, current)`；`match.flow` 表示 `candidate→current`。
+- PnP 的 3D 来自 `candidate_record.depth`，2D 来自 flow 得到的当前帧像素。
+- PnP 输出 `T_current_candidate`。GlobalPGO 约定 `src=candidate`、`dst=current`，边测量保存为 `inverse(T_current_candidate)`。
+- 几何估计和 GlobalPGO 使用左目 sensor pose，不混用 body pose。
+- 每个候选的诊断索引必须始终引用公共 `candidate_uv` 原始采样索引。
+- Phase B/B.5 前后 `VisualMap.frames.data["pose"]` 必须逐位不变。
 
-允许：配置启停；初始化时注入 Frontend；成功跟踪且非插值帧的低频缓存；`terminate()` 离线检索与验证。
+## 5. 已冻结实验结论
 
-禁止：改变原始 `run_pair` 跟踪、TwoFrame 优化和地图注册语义；阶段 A/B 写回 `VisualMap.pose`；阶段 B 调用 `GlobalPGO.add_loop_edge()`。回环缓存或验证故障默认只禁用回环，原 VO 必须继续完成。
+### 5.1 Phase B covariance gate
 
-## 6. 已锁定的数据与坐标契约
+`[实验观察]` `07_15_043519` 全序列包含 128 个缓存帧、1135 个自然候选。固定门限 `uu/vv<=100` 在 597380 个入界有限点中仅保留 3992 点（约 0.67%），28 个候选到达 PnP、接受 21 条；关闭门限后 1126 个候选到达 PnP、接受 28 条。
 
-- 阶段 A 的 ORB 仅用于地点识别，不参与原 MAC-VO 前端位姿计算。
-- 离线 BoW 数据库从空状态按 `sensor_frame_idx` 回放；先查询历史，再插入当前帧，禁止未来帧泄漏。
-- 阶段 B 调用 `estimate_pair(candidate, current)`，`match.flow` 表示 `candidate→current`；返回的 `depth_current` 不是候选帧 3D 来源。
-- PnP 3D 使用 `candidate_record.depth` 与其深度协方差，2D 使用光流得到的当前帧像素。
-- PnP 输出 `T_current_candidate`；未来 GlobalPGO 中 `src=candidate`、`dst=current`，边测量保存为 `inverse(T_current_candidate)`。
-- 几何估计和 GlobalPGO 均使用左目 sensor pose，不混用 body pose。
-- 阶段 B 只生成日志和 `LoopConstraint`，任何运行后 `VisualMap.pose` 都应保持不变。
+结论：固定 `100` 是 PnP 覆盖率的直接阻断项，但 covariance 排序仍有质量作用；不能永久关闭门限。
 
-当前研究主线继续解决 FlowFormerCov 跨时刻匹配与协方差问题。VINS 式 BRIEF/ORB 描述子匹配加 PnP 可作为未来对照基线，但暂不替代主链路。
+### 5.2 强制补点路线已淘汰
 
-## 7. 最新实验：`07_11_011209`
+`[实验观察]` fixed/null、adaptive 50/100/200 同源实验分别接受 `21/48/43/32` 条。三种补点档均提高 PnP 覆盖，同时增加大误差约束；补点 cutoff 进入很高 risk 区间。
 
-本机可读结果目录：`C:\Users\13479\Desktop\code\MAC-VO-main\MAC-VO-test_1\07_11_011209`。
+`[已废弃]` 不再以“达到固定点数”为主要目标，不继续为 50/100/200 调参，也不将 gate-off 作为最终方案。保留已有实现仅供回归和消融。
 
-使用阶段 B 诊断配置；其中 `max_flow_cov=100`、`geometry.min_points=30`、`pnp.min_inliers=20`，比原计划的后两项验收门限更宽松，不能直接视为最终配置。
+已知案例：
 
-`[实验观察]`
+- `1200↔1100` 是真实回环，但 PnP 位姿误差较大，说明“真实重叠”和“相对位姿估计正确”必须分开评价。
+- `1250↔470/480` 是重复纹理误检；帧对整体 covariance 很高，但少量低 covariance 点仍能形成 PnP 内点，说明只做点级筛选不足。
+- 同一序列诊断中，帧对整体 uncertainty veto 能拒绝部分已知假回环，但真假分布仍有重叠；不能把单一固定分位数阈值直接设为通用默认值。
 
-- 1274 帧全部成功跟踪，`need_interp=0`；每 10 帧缓存，共 128 个回环帧。
-- 阶段 A 产生 1135 个历史候选，没有当前帧或未来帧泄漏；BoW 查询均值约 0.357 ms。
-- 阶段 B 验证全部 1135 个候选，接受 21 个（1.85%），耗时约 8.9 分钟。
-- 1092 个候选因 `no valid flow correspondences` 被拒绝：有限且未越界的 flow 存在，但没有点通过 `flow_cov<=100` 门限。
-- 人工候选 `200→710` 是 BoW 第 1 名却在 flow covariance gate 处失败；`170→750` 进入第 4 名但 PnP RANSAC 失败；另有人工候选没有进入 top-10。
-- 以“间隔≥100、GT距离≤8 m、GT姿态差≤30°”作为代理标签时，含真回环查询的 top-10 查询级召回约 33.3%；21 条通过约束中仅 4 条满足该代理条件。该标签不包含真实图像重叠，只能作为风险提示，不能直接等同最终 precision。
-- 缓存约 1.21 GiB；`loop_verification.json` 含非严格 JSON 的 `Infinity`；本次元数据的 Git 版本为 `NOT_AVAILABLE`。
-- `tensor_map.npz` 存在远距离地图点和极大协方差离群值；它是次级地图质量问题，与当前回环 flow gate 问题分开处理。
+### 5.3 DBoW2 冻结结论
 
-人工重点回环对：`168–748`、`161–779`、`162–811`、`174–701`、`200–706`。由于每 10 帧缓存，验证时应检查对应的邻近注册帧，而不是要求精确帧号全部存在。
+`[代码已核验]` 提交 `00ac6b2` 增加可选 DBoW2/ORBvoc 后端与 Docker ABI gate；默认仍为 `custom_binary`。服务器 gate 成功。
 
-### 7.1 2026-07-15：Phase B 同源 A/B 诊断更新
+`[实验观察]` 在当前 OpenCV ORB 描述子与 abf001 冻结审核集上，custom/DBoW2 的 Query Recall@10 分别为 `0.9211/0.8026`；DBoW2 虽降低 false candidates/query，但未保持 recall，故不晋升、不冻结阈值、不进入 MH05。该结论不能外推为 DBoW2 本身无效；论文发布前 AI 盲审标签仍需人工复核。
 
-`[代码已核验]` 已实现每候选单次 Frontend 推理的 gate-on/off 配对诊断；两分支共享 flow、covariance、mask、采样点、深度、pose snapshot 和 PnP 参数，只改变 `uu/vv <= max_flow_cov` 过滤。输出包含稳定配对、漏斗与分位数、PnP 阶段状态、严格 JSON 和 pose 只读保护；旧配置默认行为不变，Phase B 不接入 GlobalPGO。离线入口可复用既有缓存与 `queries.json`，无需重跑 VO。
+## 6. 当前冻结技术路线：Phase B.5
 
-`[代码已核验]` Phase B、Phase A、GlobalPGO 和配置测试共 `45 passed`；全仓排除 `local/trt` 后为 `111 passed, 11 deselected`。本轮相关文件的 `pyright` 为 0 错误；全仓仍有 27 项位于未修改文件的历史或缺依赖错误。
+```text
+custom_binary BoW 候选
+├─ ORB 局部匹配 + ORB PnP：传统几何基线/候选 gate 假设
+└─ 每候选单次 FlowFormerCov 推理
+   → 帧对整体 uncertainty gate
+   → q-NMS + population 专属 risk cap 点选择
+   → Flow PnP
+   → observe-only reprojection+disparity 精化与 6×6 information
+```
 
-`[实验观察]` 提交 `a81b56d` 已完成 `07_15_043519` 全序列 CUDA 运行：128 个缓存帧产生 1135 个自然候选，1135 次 Frontend 推理，A/B 配对、严格 JSON、主分支归属和 pose 只读不变量全部通过。597380 个入界有限点中，gate-on（`uu/vv <= 100`）仅保留 3992 点、28 个候选到达 PnP、接受 21 个；gate-off 保留全部点、1126 个候选到达 PnP、接受 28 个。两组共同接受 14 个，gate-on 独有 7 个，gate-off 独有 14 个；gate-off 的 1005 个候选仍因 PnP 内点不足被拒绝。
+`[设计计划]` ORB 与 Flow 必须先对全部 BoW 候选并行 observe、独立晋升；ORB 失败不得阻断 Flow 假设验证。只有 ORB 与其对应 Flow population 均晋升后才形成串联 cascade。`all_bow_candidates` 与 `orb_supported_candidates` 共享同一时间 calibration prefix，但门限、point cap、manifest 和输出物理隔离。固定控制样本始终运行影子 Flow，不进入正式约束。
 
-`[实验观察]` 结论：阈值 `100` 仅保留约 0.67% 的点，是 PnP 覆盖率的直接阻断项；但 gate-on 在到达 PnP 后具有更高的条件通过率，且 `ref_poses.npy` 离线代理检查显示 gate-off 同时增加了较准确约束和大误差约束。因此不能声称 covariance 预测错误，也不应永久关闭门限；下一轮应单独审查自适应阈值或按 covariance 排序保留点的方案，仍不得同时修改 PnP/位姿门限或接入 GlobalPGO。
+实施顺序冻结为：B5a 并行数据 → B5b prefix 无标签校准 → B5c post-prefix 冻结评价 → B5d selector shadow A/B → B5e 精化/information observe。任何 `apply` 都要求开发集与冻结集通过预注册指标和可信 manifest。
 
-### 7.2 2026-07-15：自适应低风险补点实现
+`[待验证]` 当前工作区已实现上述 B5a–B5e、严格分支输出、两阶段 manifest 晋升及离线评价入口；尚未在服务器 CUDA/Docker 环境执行，因此不得将其表述为实验通过或 Phase C 已准入。
 
-`[代码已核验]` gate-on 可选 `flow_cov_adaptive_target_points`：先保留原 `uu/vv <= 100` 核心点，再按 `max(uu,vv)` 与原始采样索引稳定补足 covariance 阶段目标；缺失或 `null` 完全保持固定门限，gate-off 不变。新增补点前后、PnP 内外点 covariance/原始索引诊断及冻结 GT 位姿代理；不修改 PnP、VO 门限、selector、GlobalPGO 或轨迹。相关 pytest 回归为 `52 passed`。
+### 6.1 帧对级自适应 uncertainty veto
 
-`[待验证]` CUDA 只在服务器运行。须在 `07_15_043519` 同一缓存分别生成 fixed/null、adaptive 50/100/200 独立结果，先确认新代码 fixed 基线与 `a81b56d` 的签名、PnP 状态、接受集合和约束数值一致，再作单序列 Pareto 判断；完成前不得把 `100` 称为通用默认值。
+- 母集为现有最多 800 个候选深度采样点中入界且 flow 有限的点；不使用 covariance gate 或 PnP 内点后的分布。
+- `Σn=diag(1/W,1/H)Σdiag(1/W,1/H)`；pair risk 为对称化 `Σn` 的 `λmax`，正式第一版仅使用 `median(log(max(risk,1e-12)))`。
+- 最早 20% 有效查询确定唯一 `calibration_end_sensor_frame_idx`，prefix 不进入正式评价且不得因 population 样本不足向后扩展。
+- 门限为 prefix 内 pair-risk p50 的 `median + 2×1.4826×MAD`，并要求有效点≥30、有效率≥0.8、8×8覆盖≥8以及开发集冻结的绝对 calibration sanity cap。
+- calibration 不读标签；post-prefix 冻结审核集才评价。样本不足或开发/冻结集任一未通过时保持 observe。
 
-## 8. 当前问题、下一步与进入阶段 C 的条件
+### 6.2 点级选择
 
-### P0：FlowFormerCov 协方差门控
+- pair 统计点与 dense NMS 点是两个独立集合；NMS 点原始索引为 `v×W+u`。
+- 点级 score 使用前端原始 `q=uu+vv-2uv`；pair risk 仍使用归一化 `λmax`，二者不得混用。
+- 非法 covariance 在 NMS 前置为 `+inf`；公共 helper 在原前端不传 mask，保持历史行为。
+- point cap 为对应 population calibration NMS risk 的 Q95；不强制补点，按 8×8 网格稳定选择。只有同次推理的 legacy/shadow A/B 通过预注册召回、误检、GT 位姿代理和控制样本条件后才能 apply。
 
-自适应低风险补点代码已完成，下一步是在服务器对同一缓存运行 fixed/null、adaptive 50/100/200。选择标准为提高 PnP 覆盖与准确代理数量且不增加大误差代理；若同属 Pareto 前沿，优先更小 target/cutoff。不把 gate-off 或单序列胜出 target 直接设为通用默认值，不同时调整 PnP/位姿门限，也不接入 GlobalPGO。
+### 6.3 几何残差与双深度
 
-### P1：召回与验证质量
+- PnP 继续作为稳健初值和外点剔除器。
+- 主精化路线采用原 MAC-VO `disp` 思想：每点残差为当前帧二维重投影误差 `[u,v]` 加当前帧视差误差 `[disp]`。
+- 当前帧 depth/disparity 因而参与验证，可检查 PnP 是否得到度量深度支持；这比第一版新增独立 3D–3D RANSAC 更低侵入。
+- 配对 3D–3D 刚体配准只作为可选离线诊断。若与 `reproj+disp` 无互补证据，不进入最终在线链路。
 
-阶段 A 的 top-10 仍会漏掉部分人工回环；但当前先排除 flow gate 的阻断，再统一评估 `top_k`、ORB/BoW 参数和几何通过率，避免同时改变过多变量。
+### 6.4 covariance 与 6×6 information
 
-### P1：可复现性与输出格式
+- 候选 3D 点 covariance 是候选像素与视差/深度不确定性通过相机模型传播得到的 3×3 covariance。
+- 当前观测包含 flow 的 2×2 covariance 与当前 disparity covariance。
+- 严格的 `[u,v,disp]` 残差 covariance 还须包含候选 3D 点 covariance 经投影 Jacobian 的贡献；把候选 3D 点当作精确常量只可作为消融近似。
+- 局部相对位姿以 `SE(3)` 为优化量；从加权正规方程获得 `Λ_loop≈Σ JᵀΣ_r⁻¹J`，作为未来回环边的 6×6 information。
+- 稠密 flow 点高度相关，原始 Hessian 不能直接视为已标定 information。必须记录有效样本数、特征值、秩和条件数，并研究空间降采样/相关性修正、总体尺度标定和特征值上下限。
+- 位姿或边方向求逆时，covariance/information 必须按 `SE(3)` Adjoint 变换，不能原样复制。
 
-- 将验证失败的无穷指标序列化为 `null`，保证严格 JSON。
-- 每次运行保存 Git branch、commit、完整展开配置和结果目录。
-- 不把缓存、模型或运行结果提交到 GitHub；只提交代码、配置、测试和小型文档。
+## 7. Phase C 准入与后端原则
 
-### 阶段 C 准入条件
+进入 Phase C 前必须满足：
 
-人工真回环能稳定产生足够 3D–2D 对应与 PnP 内点；明显错误候选被几何门控拒绝；LoopConstraint 的索引、坐标系和方向通过 synthetic residual test；阶段 B 运行前后轨迹完全不变。满足这些条件后，再制定 GlobalPGO 回环边注册、Huber、安全检查和写回方案。
+1. 至少一个 Flow population 的 pair gate 在开发集和未参与调参的冻结集通过量化晋升条件；ORB 仅独立晋升后才可组成 cascade。
+2. 对应 q-NMS/risk-cap selector 通过同源 shadow A/B；真实回环 PnP 不下降，reviewed false 和 GT large-error 约束不增加。
+3. `1200↔1100` 与 `1250↔470/480` 等控制案例有可解释结果，但不得替代全体统计。
+4. 6×6 information 对称、半正定、方向正确、数值可观且尺度经过离线标定；退化时能拒绝或降权。
+5. `LoopConstraint` 索引、坐标系和方向通过 synthetic residual test。
+6. Phase B.5 前后 pose 不变量、严格 JSON、分支隔离、单候选单次 Frontend 和可信 manifest 校验全部通过。
 
-## 9. 新 Agent 阅读与交接清单
+Phase C 才允许：
+
+- 将主分支 `LoopConstraint` 注册进 GlobalPGO；
+- 对白化/马氏 SE(3) 残差使用 Huber；
+- 添加优化前后安全检查和轨迹写回。
+
+information 与 Huber 不冲突：前者描述正常条件下六个方向的统计置信度，后者限制异常大残差边的影响。Huber 不能替代 Phase B.5 的错误回环拒绝；若仍存在低残差假回环，再评估 switchable constraints/DCS。
+
+## 8. 测试、输出与运行约束
+
+- 主要测试方式保持为 `pytest` 与服务器离线/完整 VO；不新增独立测试框架。
+- 验证失败的未计算指标写 `null`，所有 JSON 使用严格序列化。
+- 每次运行保存 branch、commit、展开配置、代码/输入摘要和独立结果目录。
+- 缓存、模型和运行结果不提交 GitHub；只提交代码、配置、测试和小型文档。
+- 正式完整 VO 只在 Phase B.5 准入通过且准备验证 Phase C 时运行。
+
+## 9. Git 与新 Agent 阅读清单
+
+协作规则见 [`AGENT_SYNC_GUIDE.md`](./AGENT_SYNC_GUIDE.md)。不得使用 `reset --hard`、`checkout -- .`、`clean -fd`、强制推送或覆盖其他 Agent 改动。只暂存和提交当前任务相关文件。
 
 推荐阅读顺序：
 
-1. 本文件：研究目标、当前状态和阻断项。
-2. [`AGENT_SYNC_GUIDE.md`](./AGENT_SYNC_GUIDE.md)：分支、提交、拉取、代理与交接规范。
-3. `MACVO.py`、`Odometry/MACVO.py`：真实入口与终止调用顺序。
-4. `Module/LoopClosure/`：阶段 A/B 当前实现。
-5. `Module/Optimization/GlobalPGO/`：阶段 C 将使用的后端接口。
-6. `Config/Experiment/MACVO/MACVO_Performant_LoopPhaseB.yaml`：当前诊断配置。
-7. 最新结果目录的 `queries.json`、`loop_verification.json`、`loop_constraints.json`。
+1. 本文件。
+2. `Module/LoopClosure/Verification.py` 与 `Manager.py`。
+3. `Module/Covariance/Project2to3.py`。
+4. `Module/Optimization/TwoFramePGO/Graphs.py` 与 `Optimizer.py`。
+5. `Module/Optimization/GlobalPGO/`。
+6. `Config/Experiment/MACVO/MACVO_Performant_LoopPhaseB.yaml`。
+7. `07_15_043519` 的 `queries.json`、`loop_verification.json` 与各档对比结果。
 
-交接记录模板：
-
-```text
-Branch / commit:
-Changed files:
-What was done:
-Evidence / tests:
-Known issues:
-Impact on current plan:
-Next single priority:
-PROJECT_CONTEXT.md updated: yes/no
-```
-
-本文件只记录已压缩的结论、证据、影响和下一步，不粘贴聊天全文。出现以下节点必须更新：阶段或路线改变；关键接口/坐标约定改变；重要提交；有效实验；新阻断项被确认或关闭；跨 Agent 交接。
+交接必须记录：branch/commit、改动文件、完成内容、验证、已知问题、对当前路线的影响、下一项唯一优先事项，以及本文件是否更新。
