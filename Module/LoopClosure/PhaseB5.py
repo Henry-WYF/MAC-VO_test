@@ -17,6 +17,7 @@ import torch
 from Module.Frontend.Frontend import IFrontend
 from Module.Frontend.Matching import IMatcher
 from Module.Frontend.StereoDepth import IStereoDepth
+from Utility.Config import optional_config_value
 from Utility.Point import filterPointsInRange, pixel2point_NED
 from Utility.Selection import local_minimum_nms
 
@@ -850,6 +851,18 @@ class PhaseB5Analyzer:
         record_root: Path | None = None,
     ) -> None:
         self.config = config
+        if hasattr(config, "trusted_manifest"):
+            config.trusted_manifest = optional_config_value(config.trusted_manifest)
+        calibration_options = getattr(config, "calibration", None)
+        if isinstance(calibration_options, SimpleNamespace):
+            for key in (
+                "absolute_median_log_risk_cap", "absolute_q95_log_risk_cap",
+            ):
+                if hasattr(calibration_options, key):
+                    setattr(
+                        calibration_options, key,
+                        optional_config_value(getattr(calibration_options, key)),
+                    )
         self.mode = str(getattr(config, "mode", "disabled"))
         self.enabled = bool(getattr(config, "enabled", False)) and self.mode != "disabled"
         valid_queries = sorted(

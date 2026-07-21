@@ -218,10 +218,19 @@ def test_phase_a_query_failure_preserves_cache_and_disables_downstream(
     assert not manager.geometry_enabled
 
 
-@pytest.mark.parametrize("value", [True, -0.1, 1.1, float("nan")])
+@pytest.mark.parametrize(
+    "value", [True, -0.1, 1.1, float("nan"), SimpleNamespace(value=1)]
+)
 def test_bow_min_score_validation_rejects_invalid_values(tmp_path: Path, value) -> None:
     with pytest.raises(ValueError):
         LoopClosureManager.is_valid_config(make_config(tmp_path / "unused.npz", bow_min_score=value))
+
+
+def test_yaml_null_namespace_is_accepted_for_optional_bow_score(tmp_path: Path) -> None:
+    config = make_config(tmp_path / "unused.npz", bow_min_score=SimpleNamespace())
+    LoopClosureManager.is_valid_config(config)
+    manager = LoopClosureManager(config)
+    assert manager.config.bow_min_score is None
 
 
 def test_dbow2_native_binding_with_tiny_text_vocabulary(tmp_path: Path) -> None:

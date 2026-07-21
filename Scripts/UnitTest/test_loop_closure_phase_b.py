@@ -668,14 +668,15 @@ def test_phase_b5_observe_writes_isolated_branches_without_extra_frontend_calls(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     config = make_config(tmp_path, gate=False, compare=True)
+    config.bow_min_score = SimpleNamespace()
     config.phase_b5 = SimpleNamespace(
         enabled=True,
         mode="observe",
-        trusted_manifest=None,
+        trusted_manifest=SimpleNamespace(),
         calibration=SimpleNamespace(
             prefix_fraction=0.2, min_queries=20, min_all_bow_pairs=100,
-            min_orb_pairs=30, absolute_median_log_risk_cap=None,
-            absolute_q95_log_risk_cap=None,
+            min_orb_pairs=30, absolute_median_log_risk_cap=SimpleNamespace(),
+            absolute_q95_log_risk_cap=SimpleNamespace(),
         ),
         orb=SimpleNamespace(ratio=0.8, max_depth=20.0),
         flow=SimpleNamespace(
@@ -686,6 +687,10 @@ def test_phase_b5_observe_writes_isolated_branches_without_extra_frontend_calls(
     )
     LoopClosureManager.is_valid_config(config)
     manager = LoopClosureManager(config)
+    assert manager.config.bow_min_score is None
+    assert manager.config.phase_b5.trusted_manifest is None
+    assert manager.config.phase_b5.calibration.absolute_median_log_risk_cap is None
+    assert manager.config.phase_b5.calibration.absolute_q95_log_risk_cap is None
     output_dir = tmp_path / "loop_closure"
     record_dir = tmp_path / "cache"
     manager.set_output_dir(output_dir)

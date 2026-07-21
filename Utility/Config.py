@@ -113,3 +113,20 @@ def asNamespace(dictionary) -> types.SimpleNamespace:
             return types.SimpleNamespace(**obj)
         return obj
     return json.loads(json.dumps(dictionary), object_hook=load_object)
+
+
+def is_config_null(value: Any) -> bool:
+    """Return whether ``value`` is the namespace sentinel used for YAML ``null``.
+
+    ``asNamespace`` intentionally converts every YAML null to an empty namespace so
+    empty component sections such as ``args:`` remain attribute-accessible.  Scalar
+    optional fields must therefore opt in to treating that sentinel as ``None``.
+    """
+    return value is None or (
+        isinstance(value, types.SimpleNamespace) and len(vars(value)) == 0
+    )
+
+
+def optional_config_value(value: Any) -> Any | None:
+    """Convert the YAML-null sentinel to real ``None`` at an optional scalar boundary."""
+    return None if is_config_null(value) else value

@@ -17,6 +17,7 @@ from DataLoader import StereoFrame
 from Module.Frontend.Frontend import IFrontend
 from Module.Frontend.StereoDepth import IStereoDepth
 from Module.Map import VisualMap
+from Utility.Config import is_config_null, optional_config_value
 from Utility.Extensions import ConfigTestable
 from Utility.PrettyPrint import Logger
 
@@ -75,6 +76,22 @@ def _json_safe(value: Any) -> Any:
 
 class LoopClosureManager(ConfigTestable):
     def __init__(self, config: SimpleNamespace) -> None:
+        # Utility.Config represents YAML null as an empty namespace.  Normalize
+        # only optional scalar fields; empty component ``args:`` sections retain
+        # their historical namespace behavior.
+        if hasattr(config, "bow_min_score"):
+            config.bow_min_score = optional_config_value(config.bow_min_score)
+        phase_b5 = getattr(config, "phase_b5", None)
+        if isinstance(phase_b5, SimpleNamespace):
+            if hasattr(phase_b5, "trusted_manifest"):
+                phase_b5.trusted_manifest = optional_config_value(phase_b5.trusted_manifest)
+            calibration = getattr(phase_b5, "calibration", None)
+            if isinstance(calibration, SimpleNamespace):
+                for key in (
+                    "absolute_median_log_risk_cap", "absolute_q95_log_risk_cap",
+                ):
+                    if hasattr(calibration, key):
+                        setattr(calibration, key, optional_config_value(getattr(calibration, key)))
         self.config = config
         self.enabled = bool(config.enabled)
         self.cache_enabled = bool(config.enabled)
@@ -114,7 +131,7 @@ class LoopClosureManager(ConfigTestable):
         cls._enforce_config_spec(config, base_spec, allow_excessive_cfg=True)
         optional_base = {
             "recognizer_type": lambda value: value in {"custom_binary", "dbow2_orb"},
-            "bow_min_score": lambda value: value is None or _is_number(
+            "bow_min_score": lambda value: is_config_null(value) or _is_number(
                 value, lambda item: math.isfinite(float(item)) and 0.0 <= float(item) <= 1.0
             ),
         }
@@ -183,15 +200,15 @@ class LoopClosureManager(ConfigTestable):
                     "orb": lambda value: isinstance(value, SimpleNamespace),
                     "flow": lambda value: isinstance(value, SimpleNamespace),
                 },
-                {"trusted_manifest": lambda value: value is None or isinstance(value, str)},
+                {"trusted_manifest": lambda value: is_config_null(value) or isinstance(value, str)},
             )
             _validate_section(config.phase_b5.calibration, {
                 "prefix_fraction": lambda value: _is_number(value, lambda item: 0.0 < item < 1.0),
                 "min_queries": lambda value: _is_int(value, lambda item: item > 0),
                 "min_all_bow_pairs": lambda value: _is_int(value, lambda item: item > 0),
                 "min_orb_pairs": lambda value: _is_int(value, lambda item: item > 0),
-                "absolute_median_log_risk_cap": lambda value: value is None or _is_number(value, math.isfinite),
-                "absolute_q95_log_risk_cap": lambda value: value is None or _is_number(value, math.isfinite),
+                "absolute_median_log_risk_cap": lambda value: is_config_null(value) or _is_number(value, math.isfinite),
+                "absolute_q95_log_risk_cap": lambda value: is_config_null(value) or _is_number(value, math.isfinite),
             })
             _validate_section(config.phase_b5.orb, {
                 "ratio": lambda value: _is_number(value, lambda item: 0.0 < item < 1.0),
