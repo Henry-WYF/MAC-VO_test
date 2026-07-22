@@ -34,6 +34,7 @@ from .Record import GeometryFeatureRecord, LoopFrameRecord
 from .PhaseB5 import PhaseB5Analyzer
 from .VINSGeometry import (
     GeometryResult,
+    cached_orb_geometry,
     fixed_loop_information,
     fixed_point_covariance,
     verify_fixed_geometry,
@@ -251,6 +252,8 @@ class LoopClosureManager(ConfigTestable):
                 "min_inliers": lambda value: _is_int(value, lambda item: item >= 4),
                 "max_translation_m": lambda value: _is_number(value, lambda item: item > 0.0),
                 "max_rotation_deg": lambda value: _is_number(value, lambda item: 0.0 < item <= 180.0),
+            }, {
+                "feature_source": lambda value: value in {"fixed_covariance", "orb_detected"},
             })
 
     def set_frontend(self, frontend: IFrontend) -> None:
@@ -296,6 +299,14 @@ class LoopClosureManager(ConfigTestable):
     def set_match_cov_default(self, value: float) -> None:
         self.match_cov_default = float(value)
 
+    @property
+    def requires_geometry_sidecar(self) -> bool:
+        return (
+            self.vins_geometry_enabled
+            and getattr(self.config.vins_geometry, "feature_source", "fixed_covariance")
+            == "fixed_covariance"
+        )
+
     def geometry_sidecar_path(self, loop_frame_idx: int, root: Path | None = None) -> Path:
         base = self.output_dir if root is None else Path(root)
         if base is None:
@@ -315,7 +326,7 @@ class LoopClosureManager(ConfigTestable):
         disparity: torch.Tensor,
         disparity_variance: torch.Tensor,
     ) -> bool:
-        if not self.cache_enabled or not self.vins_geometry_enabled:
+        if not self.cache_enabled or not self.requires_geometry_sidecar:
             return False
         if self.output_dir is None or self.extractor is None or self.match_cov_default is None:
             return False
@@ -983,13 +994,35 @@ class LoopClosureManager(ConfigTestable):
         pgo_fixed_constraints: list[dict[str, Any]] = []
         pgo_covariance_constraints: list[dict[str, Any]] = []
         config = self.config.vins_geometry
+        feature_source = str(getattr(config, "feature_source", "fixed_covariance"))
+        geometry_cache: dict[int, tuple[GeometryFeatureRecord | None, str | None, dict[str, Any]]] = {}
+
+        def load_geometry(
+            metadata: dict[str, Any], frame: LoopFrameRecord,
+        ) -> tuple[GeometryFeatureRecord | None, str | None, dict[str, Any]]:
+            loop_idx = int(metadata["loop_frame_idx"])
+            if loop_idx in geometry_cache:
+                return geometry_cache[loop_idx]
+            if feature_source == "orb_detected":
+                loaded = cached_orb_geometry(frame, self.match_cov_default)
+            else:
+                record = self._load_geometry_sidecar(metadata, record_root)
+                loaded = (
+                    record,
+                    None if record is not None else "geometry_sidecar_unavailable",
+                    {},
+                )
+            geometry_cache[loop_idx] = loaded
+            return loaded
 
         for query in queries:
             current_meta = metadata_by_loop.get(int(query["loop_frame_idx"]))
             if current_meta is None:
                 continue
-            current_geometry = self._load_geometry_sidecar(current_meta, record_root)
             current_frame = LoopFrameRecord.load(record_root / current_meta["file"])
+            current_geometry, current_error, current_diagnostics = load_geometry(
+                current_meta, current_frame,
+            )
             candidates = sorted(
                 query.get("candidates", []),
                 key=lambda item: (-float(item.get("score", 0.0)), int(item["sensor_frame_idx"])),
@@ -1001,19 +1034,28 @@ class LoopClosureManager(ConfigTestable):
                 if current_geometry is None or candidate_meta is None:
                     rows.append({
                         "pair_id": pair_id, "status": "rejected",
-                        "reject_code": "geometry_sidecar_unavailable", "geometry_accepted": False,
-                        "information_valid": False, "pgo_comparison_eligible": False,
-                    })
-                    continue
-                candidate_geometry = self._load_geometry_sidecar(candidate_meta, record_root)
-                if candidate_geometry is None:
-                    rows.append({
-                        "pair_id": pair_id, "status": "rejected",
-                        "reject_code": "geometry_sidecar_unavailable", "geometry_accepted": False,
+                        "reject_code": current_error or "geometry_cache_metadata_unavailable",
+                        "feature_source": feature_source,
+                        "current_orb": current_diagnostics,
+                        "geometry_accepted": False,
                         "information_valid": False, "pgo_comparison_eligible": False,
                     })
                     continue
                 candidate_frame = LoopFrameRecord.load(record_root / candidate_meta["file"])
+                candidate_geometry, candidate_error, candidate_diagnostics = load_geometry(
+                    candidate_meta, candidate_frame,
+                )
+                if candidate_geometry is None:
+                    rows.append({
+                        "pair_id": pair_id, "status": "rejected",
+                        "reject_code": candidate_error or "geometry_sidecar_unavailable",
+                        "feature_source": feature_source,
+                        "current_orb": current_diagnostics,
+                        "candidate_orb": candidate_diagnostics,
+                        "geometry_accepted": False,
+                        "information_valid": False, "pgo_comparison_eligible": False,
+                    })
+                    continue
                 try:
                     result = verify_fixed_geometry(
                         config, query, candidate, current_frame, candidate_frame,
@@ -1024,10 +1066,18 @@ class LoopClosureManager(ConfigTestable):
                     rows.append({
                         "pair_id": pair_id, "status": "rejected",
                         "reject_code": "verification_exception", "reject_reason": str(error),
+                        "feature_source": feature_source,
+                        "current_orb": current_diagnostics,
+                        "candidate_orb": candidate_diagnostics,
                         "geometry_accepted": False, "information_valid": False,
                         "pgo_comparison_eligible": False,
                     })
                     continue
+                result.row.update({
+                    "feature_source": feature_source,
+                    "current_orb": current_diagnostics,
+                    "candidate_orb": candidate_diagnostics,
+                })
                 rows.append(result.row)
                 if result.constraint is not None:
                     result.row["selected_for_query"] = False
@@ -1050,7 +1100,8 @@ class LoopClosureManager(ConfigTestable):
             raise RuntimeError("VINS-style loop verification modified VisualMap poses")
         payload = {
             "schema_version": 1,
-            "mode": "vins_fixed_features_disp_information_observe",
+            "mode": "vins_geometry_disp_information_observe",
+            "feature_source": feature_source,
             "summary": {
                 "attempted_pairs": len(rows),
                 "geometry_accepted_pairs": sum(row.get("geometry_accepted") is True for row in rows),
@@ -1066,17 +1117,20 @@ class LoopClosureManager(ConfigTestable):
         }
         constraints_payload = {
             "schema_version": 1,
+            "feature_source": feature_source,
             "pose_direction": "relative_pose = T_candidate_current = inverse(T_current_candidate)",
             "information_policy": "fixed_information; covariance information is observe-only",
             "constraints": [constraint.to_dict() for constraint in selected_constraints],
         }
         pgo_fixed_payload = {
             "schema_version": 1,
+            "feature_source": feature_source,
             "information_policy": "fixed_information",
             "constraints": pgo_fixed_constraints,
         }
         pgo_covariance_payload = {
             "schema_version": 1,
+            "feature_source": feature_source,
             "information_policy": "disp_covariance_information_observe",
             "constraints": pgo_covariance_constraints,
         }

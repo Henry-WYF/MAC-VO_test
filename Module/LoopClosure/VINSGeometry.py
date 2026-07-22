@@ -14,6 +14,7 @@ import torch
 
 from Module.Covariance.Project2to3 import Covariance_2to3_full
 from Module.Optimization.GlobalPGO import make_information
+from Utility.Point import pixel2point_NED
 
 from .PhaseB5 import reproj_disp_linearization, transform_information_for_inverse
 from .Record import GeometryFeatureRecord, LoopFrameRecord
@@ -38,6 +39,99 @@ class GeometryResult:
     row: dict[str, Any]
     constraint: LoopConstraint | None
     covariance_information: torch.Tensor | None
+
+
+def cached_orb_geometry(
+    frame: LoopFrameRecord,
+    pixel_variance: float,
+) -> tuple[GeometryFeatureRecord | None, str | None, dict[str, Any]]:
+    """Adapt cached detected ORB points to the existing geometry verifier in memory."""
+    keypoints = frame.orb_keypoints
+    descriptors = frame.orb_descriptors
+    diagnostics: dict[str, Any] = {
+        "orb_descriptors": int(len(descriptors)) if descriptors.ndim > 0 else 0,
+        "orb_pixel_covariance_mode": "fixed_match_cov_default",
+        "disparity_variance_source": "derived_from_cached_depth_covariance",
+    }
+    valid_layout = (
+        keypoints.ndim == 2 and keypoints.shape[1] >= 2
+        and keypoints.dtype.is_floating_point
+        and descriptors.ndim == 2 and descriptors.shape[1] == 32
+        and descriptors.dtype == torch.uint8
+        and len(keypoints) == len(descriptors)
+    )
+    if not valid_layout or (len(keypoints) and not bool(torch.isfinite(keypoints[:, :2]).all())):
+        return None, "invalid_orb_cache_layout", diagnostics
+    if len(descriptors) == 0:
+        return None, "empty_orb_descriptors", diagnostics
+    depth_layout_valid = (
+        frame.depth.ndim == 4 and frame.depth.shape[:2] == (1, 1)
+        and frame.depth.shape[-2:] == (int(frame.height), int(frame.width))
+    )
+    covariance_layout_valid = (
+        frame.depth_covariance is not None
+        and frame.depth_covariance.ndim == 4
+        and frame.depth_covariance.shape[:2] == (1, 1)
+        and frame.depth_covariance.shape[-2:] == (int(frame.height), int(frame.width))
+    )
+
+    uv = keypoints[:, :2].detach().cpu().float()
+    floor_uv = torch.floor(uv).long()
+    inbound = (
+        (floor_uv[:, 0] >= 0) & (floor_uv[:, 0] < int(frame.width))
+        & (floor_uv[:, 1] >= 0) & (floor_uv[:, 1] < int(frame.height))
+    )
+    depth = torch.full((len(uv),), torch.nan, dtype=torch.float32)
+    if depth_layout_valid:
+        depth_map = frame.depth[0, 0].detach().cpu().float()
+        depth[inbound] = depth_map[floor_uv[inbound, 1], floor_uv[inbound, 0]]
+    depth_valid = inbound & torch.isfinite(depth) & (depth > 0.0)
+
+    points = torch.full((len(uv), 3), torch.nan, dtype=torch.float32)
+    K = frame.intrinsic[0] if frame.intrinsic.ndim == 3 else frame.intrinsic
+    if bool(depth_valid.any()):
+        points[depth_valid] = pixel2point_NED(uv[depth_valid], depth[depth_valid], K.float()).cpu()
+
+    depth_variance = torch.full_like(depth, torch.nan)
+    if covariance_layout_valid:
+        assert frame.depth_covariance is not None
+        covariance_map = frame.depth_covariance[0, 0].detach().cpu().float()
+        depth_variance[inbound] = covariance_map[floor_uv[inbound, 1], floor_uv[inbound, 0]]
+    covariance_valid = depth_valid & torch.isfinite(depth_variance) & (depth_variance > 0.0)
+    point_covariance = torch.full((len(uv), 3, 3), torch.nan, dtype=torch.float64)
+    if bool(covariance_valid.any()):
+        point_covariance[covariance_valid] = fixed_point_covariance(
+            uv[covariance_valid], depth[covariance_valid], depth_variance[covariance_valid],
+            K, pixel_variance,
+        )
+
+    fx_baseline = float(K[0, 0]) * float(frame.baseline.reshape(-1)[0])
+    disparity = torch.full_like(depth, torch.nan)
+    disparity[depth_valid] = fx_baseline / depth[depth_valid]
+    disparity_variance = torch.full_like(depth, torch.nan)
+    disparity_variance[covariance_valid] = (
+        fx_baseline / depth[covariance_valid].square()
+    ).square() * depth_variance[covariance_valid]
+    disparity_valid = (
+        covariance_valid & torch.isfinite(disparity) & torch.isfinite(disparity_variance)
+        & (disparity > 0.0) & (disparity_variance > 0.0)
+    )
+    diagnostics.update({
+        "depth_layout_valid": depth_layout_valid,
+        "depth_covariance_layout_valid": covariance_layout_valid,
+        "inbound_orb_points": int(inbound.sum()),
+        "valid_depth_orb_points": int(depth_valid.sum()),
+        "valid_covariance_orb_points": int(covariance_valid.sum()),
+    })
+    record = GeometryFeatureRecord(
+        sensor_frame_idx=int(frame.sensor_frame_idx), visual_map_idx=int(frame.visual_map_idx),
+        loop_frame_idx=int(frame.loop_frame_idx), orb_config_sha256="cached_orb_detected",
+        original_index=torch.arange(len(uv), dtype=torch.long), pixel_uv=uv,
+        point_camera=points, point_covariance_camera=point_covariance,
+        disparity=disparity, disparity_variance=disparity_variance,
+        disparity_valid=disparity_valid, descriptor=descriptors.detach().cpu().clone(),
+    )
+    return record, None, diagnostics
 
 
 def stable_seed(current_sensor_idx: int, candidate_sensor_idx: int) -> int:
@@ -252,6 +346,7 @@ def verify_fixed_geometry(
     valid = torch.isfinite(points_ned).all(dim=1) & torch.isfinite(image_uv).all(dim=1) & (points_ned[:, 0] > 0.0)
     points_ned, image_uv = points_ned[valid], image_uv[valid]
     current_local, candidate_local = current_local[valid], candidate_local[valid]
+    row["pnp_input_points"] = int(len(points_ned))
     if len(points_ned) < 4:
         row.update({"reject_code": "insufficient_finite_positive_input", "elapsed_ms": (time.perf_counter() - started) * 1000.0})
         return GeometryResult(row, None, None)
@@ -324,6 +419,10 @@ def verify_fixed_geometry(
     disp_valid &= torch.isfinite(current.disparity[selected_current])
     disp_valid &= torch.isfinite(current.disparity_variance[selected_current])
     disp_valid &= current.disparity_variance[selected_current] > 0.0
+    disp_valid &= torch.isfinite(historical.point_camera[selected_candidate]).all(dim=1)
+    disp_valid &= torch.isfinite(historical.point_covariance_camera[selected_candidate]).all(dim=(1, 2))
+    disp_valid &= torch.isfinite(current.pixel_uv[selected_current]).all(dim=1)
+    row["information_valid_inliers"] = int(disp_valid.sum())
     info_matrix = None
     info_payload: dict[str, Any]
     if int(disp_valid.sum()) == 0:

@@ -507,6 +507,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--phase-b5-manifest", type=Path)
     parser.add_argument("--phase-b5-absolute-median-cap", type=float)
     parser.add_argument("--phase-b5-absolute-q95-cap", type=float)
+    parser.add_argument(
+        "--vins-feature-source", choices=("fixed_covariance", "orb_detected"),
+        help="Override the VINS-style local geometry feature source in memory.",
+    )
     return parser.parse_args()
 
 
@@ -528,6 +532,10 @@ def main() -> None:
     loop_config = config.Odometry.loop_closure
     frontend_config = config.Odometry.frontend
     vins_mode = bool(getattr(getattr(loop_config, "vins_geometry", None), "enabled", False))
+    if args.vins_feature_source is not None:
+        if not hasattr(loop_config, "vins_geometry"):
+            raise ValueError("--vins-feature-source requires a vins_geometry configuration")
+        loop_config.vins_geometry.feature_source = args.vins_feature_source
     if not vins_mode:
         loop_config.geometry.flow_cov_gate_enabled = args.primary_gate == "enabled"
         # Explicitly override the YAML so an omitted CLI option always means the fixed baseline.
@@ -684,6 +692,10 @@ def main() -> None:
         },
         "device": args.device,
         "vins_geometry_enabled": vins_mode,
+        "vins_geometry_feature_source": (
+            getattr(loop_config.vins_geometry, "feature_source", "fixed_covariance")
+            if hasattr(loop_config, "vins_geometry") else None
+        ),
         "configured_frontend_type": configured_frontend_type,
         "runtime_frontend_type": runtime_frontend_type,
         "nvtx_disabled_for_cpu": nvtx_disabled_for_cpu,

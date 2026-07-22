@@ -219,7 +219,7 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
         original_index: torch.Tensor,
         side: int,
     ) -> None:
-        if self.LoopClosure is None or not self.LoopClosure.vins_geometry_enabled:
+        if self.LoopClosure is None or not self.LoopClosure.requires_geometry_sidecar:
             return
         pixel = match_obs.data[f"pixel{side}_uv"]
         depth = match_obs.data[f"pixel{side}_d"].squeeze(-1)

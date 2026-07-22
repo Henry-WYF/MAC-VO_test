@@ -17,6 +17,7 @@ from Module.LoopClosure.VINSGeometry import (
     _cv_pose_to_ned,
     _ned_pose_to_cv,
     _strict_information,
+    cached_orb_geometry,
     fixed_point_covariance,
     match_fixed_descriptors,
     run_pose_copy_pgo_comparison,
@@ -28,6 +29,7 @@ from Scripts.AdHoc.RunLoopPhaseBOffline import (
     summarize_engineering_admission,
 )
 from Module.Map import VisualMap
+from Utility.Point import pixel2point_NED
 
 
 def geometry_record(descriptors: torch.Tensor, original: torch.Tensor | None = None) -> GeometryFeatureRecord:
@@ -137,6 +139,107 @@ def test_fixed_point_covariance_uses_pixel_and_same_frame_depth_variance() -> No
     )
     expected = torch.diag(torch.tensor([0.04, 1.01e-4, 1.01e-4], dtype=torch.float64))
     assert torch.allclose(covariance[0], expected, atol=1e-9)
+
+
+def test_cached_orb_geometry_floors_only_depth_lookup() -> None:
+    K = torch.tensor([[[100.0, 0.0, 50.0], [0.0, 100.0, 40.0], [0.0, 0.0, 1.0]]])
+    frame = loop_frame(20, 1, 1, K)
+    frame.orb_keypoints = torch.tensor([[10.75, 20.25, 31.0, 10.0, 1.0, 0.0, -1.0]])
+    frame.orb_descriptors = torch.zeros((1, 32), dtype=torch.uint8)
+    frame.depth.fill_(4.0)
+    frame.depth[0, 0, 20, 10] = 2.0
+    assert frame.depth_covariance is not None
+    frame.depth_covariance.fill_(0.04)
+    record, error, diagnostics = cached_orb_geometry(frame, 0.25)
+    assert error is None and record is not None
+    expected = pixel2point_NED(record.pixel_uv, torch.tensor([2.0]), K[0])
+    assert torch.allclose(record.point_camera, expected)
+    assert torch.equal(record.pixel_uv, torch.tensor([[10.75, 20.25]]))
+    assert diagnostics["inbound_orb_points"] == 1
+    assert diagnostics["valid_depth_orb_points"] == 1
+    assert torch.allclose(record.disparity, torch.tensor([10.0]))
+    assert torch.allclose(record.disparity_variance, torch.tensor([1.0]))
+
+
+def test_cached_orb_geometry_keeps_2d_and_3d_when_covariance_is_missing() -> None:
+    K = torch.tensor([[[100.0, 0.0, 50.0], [0.0, 100.0, 40.0], [0.0, 0.0, 1.0]]])
+    frame = loop_frame(20, 1, 1, K)
+    frame.orb_keypoints = torch.tensor([[10.5, 20.5, 31.0, 10.0, 1.0, 0.0, -1.0]])
+    frame.orb_descriptors = torch.zeros((1, 32), dtype=torch.uint8)
+    frame.depth.fill_(2.0)
+    frame.depth_covariance = None
+    record, error, diagnostics = cached_orb_geometry(frame, 0.25)
+    assert error is None and record is not None
+    assert torch.isfinite(record.pixel_uv).all()
+    assert torch.isfinite(record.point_camera).all()
+    assert not torch.isfinite(record.point_covariance_camera).any()
+    assert record.disparity_valid.tolist() == [False]
+    assert diagnostics["depth_covariance_layout_valid"] is False
+
+
+def test_cached_orb_geometry_requires_strictly_positive_depth_variance() -> None:
+    K = torch.tensor([[[100.0, 0.0, 50.0], [0.0, 100.0, 40.0], [0.0, 0.0, 1.0]]])
+    frame = loop_frame(20, 1, 1, K)
+    frame.orb_keypoints = torch.tensor([[10.5, 20.5, 31.0, 10.0, 1.0, 0.0, -1.0]])
+    frame.orb_descriptors = torch.zeros((1, 32), dtype=torch.uint8)
+    assert frame.depth_covariance is not None
+    frame.depth_covariance.zero_()
+    record, error, _ = cached_orb_geometry(frame, 0.25)
+    assert error is None and record is not None
+    assert torch.isfinite(record.point_camera).all()
+    assert not torch.isfinite(record.point_covariance_camera).any()
+    assert record.disparity_valid.tolist() == [False]
+
+
+@pytest.mark.parametrize(
+    "keypoints,descriptors,expected",
+    [
+        (torch.zeros((1, 1)), torch.zeros((1, 32), dtype=torch.uint8), "invalid_orb_cache_layout"),
+        (torch.zeros((1, 7)), torch.zeros((2, 32), dtype=torch.uint8), "invalid_orb_cache_layout"),
+        (torch.zeros((1, 7)), torch.zeros((1, 32)), "invalid_orb_cache_layout"),
+        (torch.empty((0, 7)), torch.empty((0, 32), dtype=torch.uint8), "empty_orb_descriptors"),
+    ],
+)
+def test_cached_orb_geometry_rejects_invalid_cache_layout(
+    keypoints: torch.Tensor, descriptors: torch.Tensor, expected: str,
+) -> None:
+    K = torch.tensor([[[100.0, 0.0, 50.0], [0.0, 100.0, 40.0], [0.0, 0.0, 1.0]]])
+    frame = loop_frame(20, 1, 1, K)
+    frame.orb_keypoints = keypoints
+    frame.orb_descriptors = descriptors
+    record, error, _ = cached_orb_geometry(frame, 0.25)
+    assert record is None
+    assert error == expected
+
+
+def test_invalid_candidate_covariance_does_not_reject_pnp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    K = torch.tensor([[100.0, 0.0, 50.0], [0.0, 100.0, 40.0], [0.0, 0.0, 1.0]])
+    candidate_geometry = pnp_geometry(26, 10, 0, 0, 0.0)
+    current_geometry = pnp_geometry(26, 20, 1, 1, 1.0)
+    candidate_geometry.point_covariance_camera[:] = torch.nan
+
+    def fake_solve(*args, **kwargs):
+        return True, args[4], args[5], np.arange(26, dtype=np.int32).reshape(-1, 1)
+
+    monkeypatch.setattr(cv2, "solvePnPRansac", fake_solve)
+    config = SimpleNamespace(
+        hamming_threshold=80, iterations=100, reproj_error_px=10.0, confidence=0.99,
+        min_inliers=26, max_translation_m=20.0, max_rotation_deg=30.0,
+    )
+    result = verify_fixed_geometry(
+        config, {"loop_frame_idx": 1},
+        {"loop_frame_idx": 0, "sensor_frame_idx": 10, "score": 1.0},
+        loop_frame(20, 1, 1, K), loop_frame(10, 0, 0, K),
+        current_geometry, candidate_geometry, pp.identity_SE3(2).tensor(),
+        0.25, torch.eye(6, dtype=torch.float64),
+    )
+    assert result.constraint is not None
+    assert result.row["geometry_accepted"] is True
+    assert result.row["information_valid"] is False
+    assert result.row["pgo_comparison_eligible"] is False
+    assert result.row["information_valid_inliers"] == 0
 
 
 @pytest.mark.parametrize(

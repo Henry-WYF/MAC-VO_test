@@ -91,10 +91,11 @@ Odometry:
       min_sensor_gap: 100
       compare_flow_cov_gate: false
 
-    # Low-intrusion VINS-style verification. BoW ORB remains retrieval-only;
-    # geometry uses descriptors computed at MAC-VO's final fixed VO points.
+    # Low-intrusion VINS-style verification. This experiment reuses the cached
+    # detected ORB points for local matching and samples their dense stereo depth.
     vins_geometry:
       enabled: true
+      feature_source: orb_detected
       max_candidates: 10
       hamming_threshold: 80
       iterations: 100

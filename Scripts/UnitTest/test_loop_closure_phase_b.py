@@ -84,6 +84,36 @@ def make_config(
     )
 
 
+def vins_geometry_config(feature_source: str | None = None) -> SimpleNamespace:
+    config = SimpleNamespace(
+        enabled=True, max_candidates=10, hamming_threshold=80, iterations=100,
+        reproj_error_px=10.0, confidence=0.99, min_inliers=26,
+        max_translation_m=20.0, max_rotation_deg=30.0,
+    )
+    if feature_source is not None:
+        config.feature_source = feature_source
+    return config
+
+
+def test_vins_feature_source_is_optional_and_controls_sidecar(tmp_path: Path) -> None:
+    legacy = make_config(tmp_path)
+    legacy.vins_geometry = vins_geometry_config()
+    LoopClosureManager.is_valid_config(legacy)
+    legacy_manager = LoopClosureManager(legacy)
+    assert legacy_manager.requires_geometry_sidecar is True
+
+    detected = make_config(tmp_path)
+    detected.vins_geometry = vins_geometry_config("orb_detected")
+    LoopClosureManager.is_valid_config(detected)
+    detected_manager = LoopClosureManager(detected)
+    assert detected_manager.requires_geometry_sidecar is False
+
+    invalid = make_config(tmp_path)
+    invalid.vins_geometry = vins_geometry_config("unknown")
+    with pytest.raises(ValueError):
+        LoopClosureManager.is_valid_config(invalid)
+
+
 def make_record(sensor_idx: int, visual_idx: int, loop_idx: int, height: int = 12, width: int = 12) -> LoopFrameRecord:
     image = torch.zeros((1, 3, height, width), dtype=torch.float32)
     intrinsic = torch.tensor(
