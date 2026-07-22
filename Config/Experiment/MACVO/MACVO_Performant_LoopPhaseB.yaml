@@ -104,7 +104,7 @@ Odometry:
       confidence: 0.99
       min_inliers: 25
       max_translation_m: 20.0
-      max_rotation_deg: 30.0
+      max_rotation_deg: 180.0
 
     geometry:
       min_points: 30
