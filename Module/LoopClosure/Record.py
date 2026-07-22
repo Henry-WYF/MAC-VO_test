@@ -103,3 +103,82 @@ class LoopFrameRecord:
         if not isinstance(payload, dict):
             raise TypeError(f"Loop-frame cache {path} does not contain a dictionary")
         return cls.from_payload(payload)
+
+
+@dataclass
+class GeometryFeatureRecord:
+    """Optional fixed VO features used only by loop geometric verification."""
+
+    sensor_frame_idx: int
+    visual_map_idx: int
+    loop_frame_idx: int
+    orb_config_sha256: str
+    original_index: torch.Tensor
+    pixel_uv: torch.Tensor
+    point_camera: torch.Tensor
+    point_covariance_camera: torch.Tensor
+    disparity: torch.Tensor
+    disparity_variance: torch.Tensor
+    disparity_valid: torch.Tensor
+    descriptor: torch.Tensor
+
+    SCHEMA_VERSION = 1
+
+    def to_payload(self) -> dict[str, Any]:
+        tensor_fields = (
+            "original_index", "pixel_uv", "point_camera", "point_covariance_camera",
+            "disparity", "disparity_variance", "disparity_valid", "descriptor",
+        )
+        payload: dict[str, Any] = {
+            "schema_version": self.SCHEMA_VERSION,
+            "sensor_frame_idx": int(self.sensor_frame_idx),
+            "visual_map_idx": int(self.visual_map_idx),
+            "loop_frame_idx": int(self.loop_frame_idx),
+            "orb_config_sha256": str(self.orb_config_sha256),
+        }
+        for name in tensor_fields:
+            payload[name] = LoopFrameRecord._cpu_clone(getattr(self, name))
+        return payload
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "GeometryFeatureRecord":
+        version = int(payload.get("schema_version", -1))
+        if version != cls.SCHEMA_VERSION:
+            raise ValueError(f"Unsupported geometry-feature schema version {version}")
+        fields = dict(payload)
+        fields.pop("schema_version")
+        record = cls(**fields)
+        count = int(record.original_index.numel())
+        if any(len(getattr(record, name)) != count for name in (
+            "pixel_uv", "point_camera", "point_covariance_camera", "disparity",
+            "disparity_variance", "disparity_valid", "descriptor",
+        )):
+            raise ValueError("Geometry-feature fields do not have a common length")
+        if record.descriptor.ndim != 2 or record.descriptor.shape[1] != 32:
+            raise ValueError(f"Invalid ORB descriptor shape {tuple(record.descriptor.shape)}")
+        return record
+
+    def save_if_absent(self, path: Path) -> bool:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            return False
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        try:
+            torch.save(self.to_payload(), temporary)
+            if path.exists():
+                return False
+            os.replace(temporary, path)
+            return True
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+
+    @classmethod
+    def load(cls, path: Path) -> "GeometryFeatureRecord":
+        try:
+            payload = torch.load(path, map_location="cpu", weights_only=True)
+        except TypeError:
+            payload = torch.load(path, map_location="cpu")
+        if not isinstance(payload, dict):
+            raise TypeError(f"Geometry-feature sidecar {path} does not contain a dictionary")
+        return cls.from_payload(payload)

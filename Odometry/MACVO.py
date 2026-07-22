@@ -65,6 +65,7 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
         self.LoopClosure = loop_closure
         if self.LoopClosure is not None:
             self.LoopClosure.set_frontend(self.Frontend)
+            self.LoopClosure.set_match_cov_default(self.match_cov_default)
         # end
 
         self.min_num_point = 10
@@ -210,6 +211,30 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
         pose = self.graph.frames.data["pose"][visual_map_idx]
         self.LoopClosure.register_loop_frame(frame, depth, visual_map_idx, pose)
 
+    def _cache_loop_geometry(
+        self,
+        frame: T_SensorFrame,
+        visual_map_idx: int,
+        match_obs: MatchObs,
+        original_index: torch.Tensor,
+        side: int,
+    ) -> None:
+        if self.LoopClosure is None or not self.LoopClosure.vins_geometry_enabled:
+            return
+        pixel = match_obs.data[f"pixel{side}_uv"]
+        depth = match_obs.data[f"pixel{side}_d"].squeeze(-1)
+        point_camera = pixel2point_NED(pixel, depth, frame.stereo.frame_K).cpu()
+        self.LoopClosure.cache_geometry_features(
+            frame, visual_map_idx,
+            original_index=original_index,
+            pixel_uv=pixel,
+            point_camera=point_camera,
+            depth=depth,
+            depth_variance=match_obs.data[f"pixel{side}_d_cov"],
+            disparity=match_obs.data[f"pixel{side}_disp"],
+            disparity_variance=match_obs.data[f"pixel{side}_disp_cov"],
+        )
+
     def run_pair(self, frame0: T_SensorFrame, frame1: T_SensorFrame) -> None:
         """
         MAC-VO 核心算法：处理一对帧 (frame0=上一关键帧, frame1=当前帧)。
@@ -323,6 +348,7 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
         })
         assert self.OutlierFilter.verify_shape(match_obs), "The provided MatchFactor does not contain all data for outlier filter."
         mask = self.OutlierFilter.filter(match_obs, torch.device("cpu"))
+        geometry_original_index = torch.arange(num_kp, dtype=torch.long)[mask]
         match_obs = match_obs[mask]
         
         # Register the factor graph #####################################################
@@ -365,7 +391,16 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
             self.Optimizer.start_optimize(
                 self.Optimizer.get_graph_data(self.graph, frame_idx)
             )
+            # Keep loop geometry separate from the original map/cache schema. The
+            # previous frame fills the initial-frame sidecar; existing sidecars are
+            # intentionally never overwritten.
+            self._cache_loop_geometry(
+                frame0, int(prev_frame_idx.item()), match_obs, geometry_original_index, 1
+            )
             self._register_loop_frame(frame1, int(frame_idx.item()), depth1)
+            self._cache_loop_geometry(
+                frame1, int(frame_idx.item()), match_obs, geometry_original_index, 2
+            )
         
         # Add (dense) mapping points to the map #########################################
         if self.mapping:

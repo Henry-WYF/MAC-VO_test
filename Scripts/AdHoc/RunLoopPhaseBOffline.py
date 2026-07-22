@@ -15,7 +15,9 @@ import torch
 
 from Module.Frontend.Frontend import IFrontend
 from Module.LoopClosure import LoopClosureManager, LoopFrameRecord
+from Module.LoopClosure.VINSGeometry import run_pose_copy_pgo_comparison
 from Module.Map import VisualMap
+from Module.Optimization.GlobalPGO import GlobalPoseGraphOptimizer
 from Utility.Config import load_config
 
 
@@ -158,6 +160,115 @@ def evaluate_gt_pose_proxy(
         "long_span_accurate": long_span_accurate,
         "rows": evaluated,
     }
+
+
+def summarize_engineering_admission(
+    gt_proxy: dict[str, Any], pose_copy_pgo: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Apply the frozen, engineering-only Phase C smoke-test criteria."""
+    requirements = {
+        "min_gt_evaluated_edges": 3,
+        "min_accurate_edges": 2,
+        "min_distinct_loop_queries": 2,
+        "required_gt_coverage": 1.0,
+        "max_large_error_edges": 0,
+        "pose_copy_pgo_executed": True,
+        "pose_copy_pgo_safe": True,
+        "original_pose_invariant": True,
+    }
+    if not gt_proxy.get("available", False):
+        return {
+            "eligible": False,
+            "reason": "gt_proxy_unavailable",
+            "requirements": requirements,
+            "pose_copy_pgo": pose_copy_pgo,
+        }
+    evaluated = int(gt_proxy.get("evaluated_constraints", 0))
+    accepted = int(gt_proxy.get("accepted_constraints", 0))
+    counts = gt_proxy.get("counts", {})
+    accurate = int(counts.get("accurate", 0))
+    large_error = int(counts.get("large_error", 0))
+    rows = gt_proxy.get("rows", [])
+    pgo = pose_copy_pgo or {}
+    distinct_queries = len({int(row["current_sensor_frame_idx"]) for row in rows})
+    coverage = float(evaluated / accepted) if accepted > 0 else 0.0
+    checks = {
+        "gt_evaluated_edges": evaluated >= requirements["min_gt_evaluated_edges"],
+        "accurate_edges": accurate >= requirements["min_accurate_edges"],
+        "distinct_loop_queries": distinct_queries >= requirements["min_distinct_loop_queries"],
+        "gt_coverage": coverage == requirements["required_gt_coverage"],
+        "large_error_edges": large_error <= requirements["max_large_error_edges"],
+        "pose_copy_pgo_executed": pgo.get("executed") is True,
+        "pose_copy_pgo_safe": pgo.get("safe") is True,
+        "original_pose_invariant": pgo.get("original_pose_invariant") is True,
+    }
+    return {
+        "eligible": all(checks.values()),
+        "reason": None if all(checks.values()) else "engineering_admission_failed",
+        "requirements": requirements,
+        "observed": {
+            "gt_evaluated_edges": evaluated,
+            "accurate_edges": accurate,
+            "distinct_loop_queries": distinct_queries,
+            "gt_coverage": coverage,
+            "large_error_edges": large_error,
+            "pose_copy_pgo_executed": pgo.get("executed"),
+            "pose_copy_pgo_safe": pgo.get("safe"),
+            "original_pose_invariant": pgo.get("original_pose_invariant"),
+        },
+        "checks": checks,
+        "interpretation": "engineering smoke-test gate; not evidence of paper-level sample sufficiency",
+    }
+
+
+def run_vins_pose_copy_pgo(
+    global_map: VisualMap,
+    global_pgo_config: Any,
+    fixed_path: Path,
+    covariance_path: Path,
+    reference_poses: torch.Tensor | None = None,
+) -> dict[str, Any]:
+    """Run fixed/covariance information on identical eligible edges and pose copies."""
+    fixed_rows = _load_json(fixed_path).get("constraints")
+    covariance_rows = _load_json(covariance_path).get("constraints")
+    if not isinstance(fixed_rows, list) or not isinstance(covariance_rows, list):
+        raise ValueError("pose-copy PGO inputs must contain constraint lists")
+    if len(fixed_rows) != len(covariance_rows):
+        raise ValueError("fixed and covariance pose-copy edge counts differ")
+    if not fixed_rows:
+        return {"executed": False, "safe": False, "reason": "no_pgo_comparison_eligible_edges", "edge_count": 0}
+
+    fixed_optimizer = GlobalPoseGraphOptimizer(global_pgo_config)
+    covariance_optimizer = GlobalPoseGraphOptimizer(global_pgo_config)
+    fixed_optimizer.register_odometry_edges(global_map)
+    covariance_optimizer.register_odometry_edges(global_map)
+    for fixed, covariance in zip(fixed_rows, covariance_rows):
+        identity_keys = (
+            "src_visual_map_idx", "dst_visual_map_idx", "src_sensor_frame_idx",
+            "dst_sensor_frame_idx", "relative_pose",
+        )
+        if any(fixed.get(key) != covariance.get(key) for key in identity_keys):
+            raise ValueError("fixed and covariance pose-copy edges are not identical")
+        fixed_optimizer.add_loop_edge(
+            int(fixed["src_visual_map_idx"]), int(fixed["dst_visual_map_idx"]),
+            torch.tensor(fixed["relative_pose"]), torch.tensor(fixed["information"]),
+        )
+        covariance_optimizer.add_loop_edge(
+            int(covariance["src_visual_map_idx"]), int(covariance["dst_visual_map_idx"]),
+            torch.tensor(covariance["relative_pose"]), torch.tensor(covariance["information"]),
+        )
+    initial = global_map.frames.data["pose"].tensor.detach().clone()
+    result = run_pose_copy_pgo_comparison(
+        fixed_optimizer, covariance_optimizer, initial, reference_poses,
+    )
+    result["executed"] = True
+    result["eligible_loop_edge_count"] = len(fixed_rows)
+    result["original_pose_invariant"] = torch.equal(
+        global_map.frames.data["pose"].tensor, initial
+    )
+    if not result["original_pose_invariant"]:
+        raise RuntimeError("pose-copy PGO modified the original VisualMap poses")
+    return result
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -304,9 +415,39 @@ def _load_visual_map(path: Path) -> VisualMap:
         if pose_key is None:
             raise ValueError(f"tensor map has no serialized frame poses: {path}")
         poses = torch.from_numpy(archive[pose_key].copy()).to(dtype=torch.float32)
+        interp_key = next(
+            (key for key in ("frames//need_interp", "frames/need_interp") if key in archive.files),
+            None,
+        )
+        need_interp = (
+            torch.from_numpy(archive[interp_key].copy()).bool()
+            if interp_key is not None else torch.zeros(len(poses), dtype=torch.bool)
+        )
+        time_key = next(
+            (key for key in ("frames//time_ns", "frames/time_ns") if key in archive.files),
+            None,
+        )
+        time_ns = torch.from_numpy(archive[time_key].copy()).long() if time_key is not None else None
     global_map = VisualMap()
+    global_map.frames.index.push(torch.arange(len(poses), dtype=torch.long))
     global_map.frames.data["pose"].push(poses)
+    global_map.frames.data["need_interp"].push(need_interp)
+    if time_ns is not None:
+        global_map.frames.data["time_ns"].push(time_ns)
     return global_map
+
+
+def _aligned_reference_poses(global_map: VisualMap, ref_poses_path: Path) -> torch.Tensor | None:
+    if not ref_poses_path.is_file():
+        return None
+    reference = np.load(ref_poses_path, allow_pickle=False)
+    times = global_map.frames.data["time_ns"].tensor.detach().cpu().numpy()
+    if reference.ndim != 2 or reference.shape[1] != 8 or len(times) != len(global_map.frames):
+        return None
+    by_time = {int(row[0]): row[1:] for row in reference}
+    if any(int(time) not in by_time for time in times):
+        return None
+    return torch.from_numpy(np.stack([by_time[int(time)] for time in times])).float()
 
 
 def limit_queries(
@@ -386,10 +527,12 @@ def main() -> None:
     config, _ = load_config(config_path)
     loop_config = config.Odometry.loop_closure
     frontend_config = config.Odometry.frontend
-    loop_config.geometry.flow_cov_gate_enabled = args.primary_gate == "enabled"
-    # Explicitly override the YAML so an omitted CLI option always means the fixed baseline.
-    loop_config.geometry.flow_cov_adaptive_target_points = args.adaptive_target_points
-    loop_config.geometric_verification.compare_flow_cov_gate = True
+    vins_mode = bool(getattr(getattr(loop_config, "vins_geometry", None), "enabled", False))
+    if not vins_mode:
+        loop_config.geometry.flow_cov_gate_enabled = args.primary_gate == "enabled"
+        # Explicitly override the YAML so an omitted CLI option always means the fixed baseline.
+        loop_config.geometry.flow_cov_adaptive_target_points = args.adaptive_target_points
+        loop_config.geometric_verification.compare_flow_cov_gate = True
     if hasattr(loop_config, "phase_b5"):
         if args.phase_b5_mode is not None:
             loop_config.phase_b5.enabled = args.phase_b5_mode != "disabled"
@@ -430,13 +573,15 @@ def main() -> None:
             runtime_frontend_type = "FlowFormerCovFrontend"
         setattr(torch.cuda.nvtx, "range", lambda *args, **kwargs: contextlib.nullcontext())
         nvtx_disabled_for_cpu = True
-    frontend = IFrontend.instantiate(runtime_frontend_type, frontend_config.args)
+    frontend = None if vins_mode else IFrontend.instantiate(runtime_frontend_type, frontend_config.args)
     manager = LoopClosureManager(loop_config)
     manager.set_output_dir(output_dir)
     if not manager.enabled or manager.output_dir is None:
         raise RuntimeError(f"loop manager could not initialize: {manager.disabled_reason}")
     manager.records = records
-    manager.set_frontend(frontend)
+    if frontend is not None:
+        manager.set_frontend(frontend)
+    manager.set_match_cov_default(float(config.Odometry.args.match_cov_default))
 
     global_map = _load_visual_map(map_path)
     pose_before = global_map.frames.data["pose"].tensor.detach().clone()
@@ -450,21 +595,53 @@ def main() -> None:
     elapsed_seconds = time.perf_counter() - started
     if not torch.equal(global_map.frames.data["pose"].tensor, pose_before):
         raise RuntimeError("offline Phase B verification modified VisualMap poses")
-    comparison_validation = validate_comparison_outputs(output_dir)
-    gt_pose_proxy = {
-        "gate_enabled": evaluate_gt_pose_proxy(
-            output_dir / "loop_constraints_gate_enabled.json",
-            result_dir / "ref_poses.npy",
-            record_dir,
-            records,
-        ),
-        "gate_disabled": evaluate_gt_pose_proxy(
-            output_dir / "loop_constraints_gate_disabled.json",
-            result_dir / "ref_poses.npy",
-            record_dir,
-            records,
-        ),
-    }
+    pose_copy_pgo = None
+    if vins_mode:
+        global_pgo_config = getattr(config.Odometry, "global_pgo", None)
+        pose_copy_pgo = (
+            run_vins_pose_copy_pgo(
+                global_map,
+                global_pgo_config,
+                output_dir / "loop_constraints_pgo_fixed.json",
+                output_dir / "loop_constraints_pgo_covariance.json",
+                _aligned_reference_poses(global_map, result_dir / "ref_poses.npy"),
+            )
+            if global_pgo_config is not None else {
+                "executed": False, "safe": False, "reason": "global_pgo_config_missing",
+            }
+        )
+        pgo_target = output_dir / "pose_copy_pgo_comparison.json"
+        pgo_temporary = pgo_target.with_suffix(".json.tmp")
+        with open(pgo_temporary, "w", encoding="utf-8") as file:
+            json.dump(pose_copy_pgo, file, indent=2, allow_nan=False)
+        pgo_temporary.replace(pgo_target)
+    comparison_validation = (
+        {
+            "vins_geometry_output": (output_dir / "loop_vins_verification.json").is_file(),
+            "pose_copy_pgo_output": (output_dir / "pose_copy_pgo_comparison.json").is_file(),
+        }
+        if vins_mode else validate_comparison_outputs(output_dir)
+    )
+    gt_pose_proxy = (
+        {
+            "vins_geometry": evaluate_gt_pose_proxy(
+                output_dir / "loop_constraints_pgo_fixed.json",
+                result_dir / "ref_poses.npy", record_dir, records,
+            ),
+            "geometry_accepted": evaluate_gt_pose_proxy(
+                output_dir / "loop_constraints.json",
+                result_dir / "ref_poses.npy", record_dir, records,
+            ),
+        }
+        if vins_mode else {
+            "gate_enabled": evaluate_gt_pose_proxy(
+                output_dir / "loop_constraints_gate_enabled.json", result_dir / "ref_poses.npy", record_dir, records,
+            ),
+            "gate_disabled": evaluate_gt_pose_proxy(
+                output_dir / "loop_constraints_gate_disabled.json", result_dir / "ref_poses.npy", record_dir, records,
+            ),
+        }
+    )
     if hasattr(loop_config, "phase_b5") and loop_config.phase_b5.mode == "apply":
         gt_pose_proxy["phase_b5_apply"] = evaluate_gt_pose_proxy(
             output_dir / "loop_constraints.json",
@@ -472,6 +649,11 @@ def main() -> None:
             record_dir,
             records,
         )
+
+    engineering_admission = (
+        summarize_engineering_admission(gt_pose_proxy["vins_geometry"], pose_copy_pgo)
+        if vins_mode else None
+    )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(index_path, output_dir / "source_index.json")
@@ -494,15 +676,19 @@ def main() -> None:
             "phase_b5": _sha256(
                 Path(__file__).resolve().parents[2] / "Module/LoopClosure/PhaseB5.py"
             ),
+            "vins_geometry": _sha256(
+                Path(__file__).resolve().parents[2] / "Module/LoopClosure/VINSGeometry.py"
+            ),
             "offline_runner": _sha256(Path(__file__).resolve()),
             "config": _sha256(config_path),
         },
         "device": args.device,
+        "vins_geometry_enabled": vins_mode,
         "configured_frontend_type": configured_frontend_type,
         "runtime_frontend_type": runtime_frontend_type,
         "nvtx_disabled_for_cpu": nvtx_disabled_for_cpu,
         "primary_gate_enabled": loop_config.geometry.flow_cov_gate_enabled,
-        "comparison_enabled": True,
+        "comparison_enabled": not vins_mode,
         "gate_enabled_selection_mode": (
             "fixed" if args.adaptive_target_points is None else "adaptive"
         ),
@@ -533,6 +719,8 @@ def main() -> None:
         "pose_invariant": True,
         "comparison_validation": comparison_validation,
         "gt_pose_proxy": gt_pose_proxy,
+        "engineering_admission": engineering_admission,
+        "pose_copy_pgo": pose_copy_pgo,
     }
     temporary = output_dir / "offline_run_manifest.json.tmp"
     with open(temporary, "w", encoding="utf-8") as file:

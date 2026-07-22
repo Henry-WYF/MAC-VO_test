@@ -64,6 +64,9 @@ class ORBFeatureExtractor:
         self.orb = cv2.ORB_create(
             nfeatures=int(nfeatures), scaleFactor=float(scale_factor), nlevels=int(nlevels)
         )
+        self.parameters = {
+            "nfeatures": int(nfeatures), "scale_factor": float(scale_factor), "nlevels": int(nlevels),
+        }
 
     @staticmethod
     def rgb_tensor_to_gray(image: torch.Tensor) -> np.ndarray:
@@ -88,6 +91,25 @@ class ORBFeatureExtractor:
             for kp in keypoints
         ], dtype=torch.float32)
         return serialized, torch.from_numpy(np.ascontiguousarray(descriptors)).to(torch.uint8)
+
+    def config_sha256(self) -> str:
+        encoded = repr(tuple(sorted(self.parameters.items()))).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def compute_at(self, image: torch.Tensor, pixel_uv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute ORB descriptors at fixed VO points without running an ORB detector."""
+        points = pixel_uv.detach().cpu().float()
+        keypoints = [
+            cv2.KeyPoint(float(uv[0]), float(uv[1]), 31.0, -1.0, 0.0, 0, int(index))
+            for index, uv in enumerate(points)
+        ]
+        returned, descriptors = self.orb.compute(self.rgb_tensor_to_gray(image), keypoints)
+        if descriptors is None or not returned:
+            return torch.empty(0, dtype=torch.long), torch.empty((0, 32), dtype=torch.uint8)
+        indices = torch.tensor([int(keypoint.class_id) for keypoint in returned], dtype=torch.long)
+        if bool(((indices < 0) | (indices >= len(points))).any()):
+            raise ValueError("ORB.compute returned an invalid fixed-point class_id")
+        return indices, torch.from_numpy(np.ascontiguousarray(descriptors)).to(torch.uint8)
 
 
 class ORBPlaceRecognizer(ORBFeatureExtractor):

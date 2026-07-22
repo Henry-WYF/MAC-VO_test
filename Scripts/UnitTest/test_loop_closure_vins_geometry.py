@@ -1,0 +1,297 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import cv2
+import numpy as np
+import pypose as pp
+import pytest
+import torch
+
+from Module.LoopClosure.Recognizer import ORBFeatureExtractor
+from Module.LoopClosure.Record import GeometryFeatureRecord
+from Module.LoopClosure.Record import LoopFrameRecord
+from Module.LoopClosure.VINSGeometry import (
+    _cv_pose_to_ned,
+    _ned_pose_to_cv,
+    _strict_information,
+    fixed_point_covariance,
+    match_fixed_descriptors,
+    run_pose_copy_pgo_comparison,
+    run_pose_copy_pgo_safety,
+    verify_fixed_geometry,
+)
+from Scripts.AdHoc.RunLoopPhaseBOffline import (
+    run_vins_pose_copy_pgo,
+    summarize_engineering_admission,
+)
+from Module.Map import VisualMap
+
+
+def geometry_record(descriptors: torch.Tensor, original: torch.Tensor | None = None) -> GeometryFeatureRecord:
+    count = len(descriptors)
+    original = torch.arange(count) if original is None else original
+    return GeometryFeatureRecord(
+        sensor_frame_idx=10, visual_map_idx=1, loop_frame_idx=1, orb_config_sha256="abc",
+        original_index=original, pixel_uv=torch.zeros((count, 2)),
+        point_camera=torch.ones((count, 3)),
+        point_covariance_camera=torch.eye(3).repeat(count, 1, 1),
+        disparity=torch.ones(count), disparity_variance=torch.ones(count),
+        disparity_valid=torch.ones(count, dtype=torch.bool), descriptor=descriptors,
+    )
+
+
+def loop_frame(sensor: int, visual: int, loop: int, K: torch.Tensor) -> LoopFrameRecord:
+    return LoopFrameRecord(
+        sensor_frame_idx=sensor, visual_map_idx=visual, loop_frame_idx=loop,
+        frame_ns=sensor, height=80, width=100, image_left=torch.zeros((1, 3, 80, 100)),
+        image_right=torch.zeros((1, 3, 80, 100)), intrinsic=K, baseline=torch.tensor([0.2]),
+        body_to_sensor=pp.identity_SE3(1).tensor(), depth=torch.ones((1, 1, 80, 100)),
+        depth_covariance=torch.ones((1, 1, 80, 100)), registered_pose=pp.identity_SE3(1).tensor(),
+        orb_keypoints=torch.empty((0, 7)), orb_descriptors=torch.empty((0, 32), dtype=torch.uint8),
+        bow_vector=None,
+    )
+
+
+def pnp_geometry(count: int, sensor: int, visual: int, loop: int, translated_x: float) -> GeometryFeatureRecord:
+    x = torch.linspace(2.0, 5.0, count)
+    y = torch.linspace(-0.7, 0.7, count)
+    z = torch.sin(torch.linspace(0.0, 3.0, count)) * 0.4
+    points = torch.stack([x, y, z], dim=-1)
+    current_x = x + translated_x
+    pixels = torch.stack([100.0 * y / current_x + 50.0, 100.0 * z / current_x + 40.0], dim=-1)
+    descriptors = torch.zeros((count, 32), dtype=torch.uint8)
+    descriptors[:, 0] = torch.arange(count, dtype=torch.uint8)
+    return GeometryFeatureRecord(
+        sensor_frame_idx=sensor, visual_map_idx=visual, loop_frame_idx=loop,
+        orb_config_sha256="abc", original_index=torch.arange(count), pixel_uv=pixels,
+        point_camera=points, point_covariance_camera=torch.eye(3).repeat(count, 1, 1) * 1e-3,
+        disparity=20.0 / current_x, disparity_variance=torch.full((count,), 0.1),
+        disparity_valid=torch.ones(count, dtype=torch.bool), descriptor=descriptors,
+    )
+
+
+def test_geometry_sidecar_first_write_is_atomic_and_not_overwritten(tmp_path: Path) -> None:
+    path = tmp_path / "geometry_features_v1" / "loop_000001.pt"
+    first = geometry_record(torch.zeros((2, 32), dtype=torch.uint8))
+    second = geometry_record(torch.ones((2, 32), dtype=torch.uint8))
+    assert first.save_if_absent(path) is True
+    assert second.save_if_absent(path) is False
+    loaded = GeometryFeatureRecord.load(path)
+    assert torch.equal(loaded.descriptor, first.descriptor)
+    assert not path.with_suffix(".pt.tmp").exists()
+
+
+def test_one_way_hamming_is_strict_and_candidate_unique() -> None:
+    candidate = geometry_record(torch.stack([
+        torch.zeros(32, dtype=torch.uint8),
+        torch.full((32,), 255, dtype=torch.uint8),
+    ]), torch.tensor([20, 10]))
+    current_desc = torch.stack([
+        torch.zeros(32, dtype=torch.uint8),
+        torch.cat([torch.tensor([1], dtype=torch.uint8), torch.zeros(31, dtype=torch.uint8)]),
+        torch.full((32,), 255, dtype=torch.uint8),
+    ])
+    current = geometry_record(current_desc, torch.tensor([3, 2, 1]))
+    matches = match_fixed_descriptors(current, candidate, 80)
+    assert [(item.current_local, item.candidate_local) for item in matches] == [(0, 0), (2, 1)]
+    exactly_80 = geometry_record(torch.cat([
+        torch.full((1, 10), 255, dtype=torch.uint8), torch.zeros((1, 22), dtype=torch.uint8)
+    ], dim=1))
+    assert match_fixed_descriptors(exactly_80, geometry_record(torch.zeros((1, 32), dtype=torch.uint8)), 80) == []
+
+
+def test_fixed_point_orb_compute_restores_class_ids_without_detection(monkeypatch: pytest.MonkeyPatch) -> None:
+    extractor = ORBFeatureExtractor()
+
+    class FakeORB:
+        def compute(self, image: np.ndarray, keypoints: list[cv2.KeyPoint]):
+            return [keypoints[2], keypoints[0]], np.stack([
+                np.full(32, 2, dtype=np.uint8), np.zeros(32, dtype=np.uint8),
+            ])
+
+    extractor.orb = FakeORB()  # type: ignore[assignment]
+    image = torch.zeros((3, 40, 40))
+    indices, descriptors = extractor.compute_at(image, torch.tensor([[10., 10.], [15., 15.], [20., 20.]]))
+    assert indices.tolist() == [2, 0]
+    assert descriptors[:, 0].tolist() == [2, 0]
+
+
+def test_ned_opencv_pose_conversion_round_trip() -> None:
+    matrix = torch.eye(4, dtype=torch.float64)
+    matrix[:3, 3] = torch.tensor([1.0, 2.0, 3.0])
+    pose = pp.from_matrix(matrix, pp.SE3_type)
+    rvec, tvec = _ned_pose_to_cv(pose)
+    restored = _cv_pose_to_ned(rvec, tvec)
+    assert torch.allclose(restored.matrix(), matrix, atol=1e-10)
+
+
+def test_fixed_point_covariance_uses_pixel_and_same_frame_depth_variance() -> None:
+    covariance = fixed_point_covariance(
+        torch.tensor([[50.0, 40.0]]), torch.tensor([2.0]), torch.tensor([0.04]),
+        torch.tensor([[100.0, 0.0, 50.0], [0.0, 100.0, 40.0], [0.0, 0.0, 1.0]]),
+        0.25,
+    )
+    expected = torch.diag(torch.tensor([0.04, 1.01e-4, 1.01e-4], dtype=torch.float64))
+    assert torch.allclose(covariance[0], expected, atol=1e-9)
+
+
+@pytest.mark.parametrize(
+    "retval,returned_inliers,expected_reject",
+    [(False, 0, "pnp_failed"), (True, 25, "insufficient_positive_inliers"), (True, 26, None)],
+)
+def test_verify_fixed_geometry_uses_vo_guess_direction_and_26_inlier_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    retval: bool,
+    returned_inliers: int,
+    expected_reject: str | None,
+) -> None:
+    K = torch.tensor([[100.0, 0.0, 50.0], [0.0, 100.0, 40.0], [0.0, 0.0, 1.0]])
+    candidate_geometry = pnp_geometry(26, 10, 0, 0, 0.0)
+    current_geometry = pnp_geometry(26, 20, 1, 1, 1.0)
+    poses = pp.identity_SE3(2).tensor()
+    poses[0, 0] = 1.0
+    captured: dict[str, object] = {}
+
+    def fake_solve(*args, **kwargs):
+        captured["rvec"] = np.asarray(args[4]).copy()
+        captured["tvec"] = np.asarray(args[5]).copy()
+        captured["use_guess"] = args[6]
+        inliers = (
+            None if returned_inliers == 0
+            else np.arange(returned_inliers, dtype=np.int32).reshape(-1, 1)
+        )
+        return retval, args[4], args[5], inliers
+
+    monkeypatch.setattr(cv2, "solvePnPRansac", fake_solve)
+    config = SimpleNamespace(
+        hamming_threshold=80, iterations=100, reproj_error_px=10.0, confidence=0.99,
+        min_inliers=26, max_translation_m=20.0, max_rotation_deg=30.0,
+    )
+    result = verify_fixed_geometry(
+        config,
+        {"loop_frame_idx": 1},
+        {"loop_frame_idx": 0, "sensor_frame_idx": 10, "score": 1.0},
+        loop_frame(20, 1, 1, K), loop_frame(10, 0, 0, K),
+        current_geometry, candidate_geometry, poses, 0.25, torch.eye(6, dtype=torch.float64),
+    )
+    assert captured["use_guess"] is True
+    assert np.allclose(np.asarray(captured["tvec"]).reshape(3), [0.0, 0.0, 1.0])
+    assert (result.constraint is not None) is (expected_reject is None)
+    if expected_reject is None:
+        expected_edge = (pp.SE3(poses[1]).Inv() @ pp.SE3(poses[0])).Inv()
+        assert torch.allclose(
+            pp.SE3(torch.tensor(result.constraint.relative_pose)).matrix(),
+            expected_edge.matrix(), atol=1e-6,
+        )
+    else:
+        assert result.row["reject_code"] == expected_reject
+
+
+def test_disp_information_checks_stacked_rank_and_only_downweights() -> None:
+    points = torch.tensor([
+        [2.0, -0.5, -0.3], [2.2, 0.4, -0.2], [2.5, -0.3, 0.4],
+        [3.0, 0.5, 0.3], [3.5, -0.6, 0.2], [4.0, 0.2, -0.4],
+    ], dtype=torch.float64)
+    K = torch.tensor([[100., 0., 50.], [0., 100., 40.], [0., 0., 1.]], dtype=torch.float64)
+    baseline = torch.tensor([0.2], dtype=torch.float64)
+    uv = torch.stack([100. * points[:, 1] / points[:, 0] + 50., 100. * points[:, 2] / points[:, 0] + 40.], dim=-1)
+    disparity = 20. / points[:, 0]
+    used, diagnostics = _strict_information(
+        pp.identity_SE3(1).double(), points, torch.eye(3).repeat(len(points), 1, 1).double() * 1e-3,
+        uv, disparity, torch.ones(len(points), dtype=torch.float64) * 0.1,
+        K, baseline, 0.25, torch.eye(6, dtype=torch.float64),
+    )
+    assert diagnostics["rank"] == 6
+    assert diagnostics["valid"] is True
+    assert used is not None
+    assert torch.linalg.eigvalsh(torch.eye(6, dtype=torch.float64) - used).min() >= -1e-8
+
+    _, single = _strict_information(
+        pp.identity_SE3(1).double(), points[:1], torch.eye(3).unsqueeze(0).double() * 1e-3,
+        uv[:1], disparity[:1], torch.ones(1, dtype=torch.float64) * 0.1,
+        K, baseline, 0.25, torch.eye(6, dtype=torch.float64),
+    )
+    assert single["rank"] <= 3
+    assert single["valid"] is False
+
+
+def test_pose_copy_safety_rejects_loss_increase() -> None:
+    class FakeOptimizer:
+        def compute_loss(self, poses: torch.Tensor) -> torch.Tensor:
+            return torch.tensor(2.0 if float(poses[1, 4]) != 0.0 else 1.0)
+
+        def optimize_poses(self, poses: torch.Tensor) -> torch.Tensor:
+            result = poses.clone()
+            result[1, 4] = 1.0
+            return result
+
+        def compute_residuals(self, poses: torch.Tensor) -> torch.Tensor:
+            return torch.zeros((1, 6))
+
+    poses = pp.identity_SE3(2).tensor()
+    optimized, diagnostics = run_pose_copy_pgo_safety(FakeOptimizer(), poses)
+    assert optimized is None
+    assert diagnostics["reason"] == "loss_increased"
+
+
+def test_pose_copy_comparison_requires_identical_edge_sets() -> None:
+    fixed = SimpleNamespace(edges=[SimpleNamespace(src=0, dst=1, edge_type="odometry")])
+    covariance = SimpleNamespace(edges=[SimpleNamespace(src=0, dst=2, edge_type="odometry")])
+    result = run_pose_copy_pgo_comparison(
+        fixed, covariance, pp.identity_SE3(3).tensor()
+    )
+    assert result["safe"] is False
+    assert result["reason"] == "pgo_edge_sets_differ"
+
+
+def test_offline_pose_copy_pgo_runs_identical_eligible_edge_files(tmp_path: Path) -> None:
+    global_map = VisualMap()
+    poses = pp.identity_SE3(3).tensor()
+    poses[1, 0] = 1.0
+    poses[2, 0] = 2.0
+    global_map.frames.index.push(torch.arange(3))
+    global_map.frames.data["pose"].push(poses)
+    global_map.frames.data["need_interp"].push(torch.zeros(3, dtype=torch.bool))
+    constraint = {
+        "src_visual_map_idx": 0, "dst_visual_map_idx": 2,
+        "src_sensor_frame_idx": 0, "dst_sensor_frame_idx": 2,
+        "relative_pose": (pp.SE3(poses[0]).Inv() @ pp.SE3(poses[2])).tensor().tolist(),
+        "information": torch.eye(6).tolist(),
+    }
+    fixed_path = tmp_path / "fixed.json"
+    covariance_path = tmp_path / "covariance.json"
+    fixed_path.write_text(json.dumps({"constraints": [constraint]}), encoding="utf-8")
+    covariance_path.write_text(json.dumps({"constraints": [constraint]}), encoding="utf-8")
+    config = SimpleNamespace(
+        enabled=False, optimize_on_terminate=False, max_iterations=5,
+        trans_weight=1.0, rot_weight=1.0, device="cpu", include_interp_frames=True,
+    )
+    before = global_map.frames.data["pose"].tensor.clone()
+    result = run_vins_pose_copy_pgo(global_map, config, fixed_path, covariance_path)
+    assert result["executed"] is True
+    assert result["safe"] is True
+    assert result["eligible_loop_edge_count"] == 1
+    assert torch.equal(global_map.frames.data["pose"].tensor, before)
+
+
+def test_engineering_admission_requires_safe_executed_pose_copy_pgo() -> None:
+    gt_proxy = {
+        "available": True, "accepted_constraints": 3, "evaluated_constraints": 3,
+        "counts": {"accurate": 3, "suspicious": 0, "large_error": 0},
+        "rows": [
+            {"current_sensor_frame_idx": 100},
+            {"current_sensor_frame_idx": 200},
+            {"current_sensor_frame_idx": 200},
+        ],
+    }
+    unsafe = summarize_engineering_admission(
+        gt_proxy, {"executed": True, "safe": False, "original_pose_invariant": True},
+    )
+    assert unsafe["eligible"] is False
+    safe = summarize_engineering_admission(
+        gt_proxy, {"executed": True, "safe": True, "original_pose_invariant": True},
+    )
+    assert safe["eligible"] is True

@@ -87,9 +87,22 @@ Odometry:
 
     geometric_verification:
       enabled: true
-      max_candidates_to_verify: 10
+      max_candidates_to_verify: 3
       min_sensor_gap: 100
-      compare_flow_cov_gate: true
+      compare_flow_cov_gate: false
+
+    # Low-intrusion VINS-style verification. BoW ORB remains retrieval-only;
+    # geometry uses descriptors computed at MAC-VO's final fixed VO points.
+    vins_geometry:
+      enabled: true
+      max_candidates: 3
+      hamming_threshold: 80
+      iterations: 100
+      reproj_error_px: 10.0
+      confidence: 0.99
+      min_inliers: 26
+      max_translation_m: 20.0
+      max_rotation_deg: 30.0
 
     geometry:
       min_points: 30
@@ -122,10 +135,10 @@ Odometry:
       trans_weight: 1.0
       rot_weight: 1.0
 
-    # Phase B.5 is diagnostics-only until a reviewed calibration manifest is promoted.
+    # Retained for reproducibility only; the VINS-style route above is primary.
     phase_b5:
-      enabled: true
-      mode: observe               # disabled | observe | apply
+      enabled: false
+      mode: disabled              # disabled | observe | apply
       trusted_manifest: null
       calibration:
         prefix_fraction: 0.2
@@ -150,6 +163,17 @@ Odometry:
         grid_rows: 8
         grid_cols: 8
         max_points_per_cell: 20
+
+  # Disabled in the online VO. The offline runner reuses this configuration on
+  # pose copies for fixed-vs-covariance information comparison only.
+  global_pgo:
+    enabled: false
+    optimize_on_terminate: false
+    max_iterations: 50
+    trans_weight: 100.0
+    rot_weight: 100.0
+    device: cpu
+    include_interp_frames: false
 
 Data: !include ../../Sequence/TartanAir_example.yaml
 Preprocess: !include ../Common/Preprocess.yaml

@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
+import cv2
 import torch
 
 from DataLoader import StereoFrame
@@ -29,8 +30,14 @@ from .Recognizer import (
     ORBFeatureExtractor,
     PlaceRecognitionBackend,
 )
-from .Record import LoopFrameRecord
+from .Record import GeometryFeatureRecord, LoopFrameRecord
 from .PhaseB5 import PhaseB5Analyzer
+from .VINSGeometry import (
+    GeometryResult,
+    fixed_loop_information,
+    fixed_point_covariance,
+    verify_fixed_geometry,
+)
 from .Verification import LoopCandidateVerifier, LoopConstraint, has_required_pnp_functions
 
 
@@ -102,6 +109,10 @@ class LoopClosureManager(ConfigTestable):
         self.last_registered_sensor_idx: int | None = None
         self.extractor: ORBFeatureExtractor | None = None
         self.frontend: IFrontend | None = None
+        self.match_cov_default: float | None = None
+        self.vins_geometry_enabled = bool(
+            config.enabled and getattr(getattr(config, "vins_geometry", None), "enabled", False)
+        )
         self.geometry_enabled = bool(
             config.enabled
             and getattr(getattr(config, "geometric_verification", None), "enabled", False)
@@ -140,7 +151,7 @@ class LoopClosureManager(ConfigTestable):
                 raise ValueError(f"Config does not match specification! ({key}={getattr(config, key)!r})")
         excessive = set(vars(config)) - (
             set(base_spec) | set(optional_base)
-            | {"geometric_verification", "geometry", "pnp", "verification", "loop_information", "phase_b5"}
+            | {"geometric_verification", "geometry", "pnp", "verification", "loop_information", "phase_b5", "vins_geometry"}
         )
         if excessive:
             raise KeyError(f"Excessive Keys: {excessive} from {list(base_spec)}")
@@ -227,6 +238,18 @@ class LoopClosureManager(ConfigTestable):
                 "grid_cols": lambda value: _is_int(value, lambda item: item > 0),
                 "max_points_per_cell": lambda value: _is_int(value, lambda item: item > 0),
             })
+        if hasattr(config, "vins_geometry"):
+            _validate_section(config.vins_geometry, {
+                "enabled": lambda value: isinstance(value, bool),
+                "max_candidates": lambda value: _is_int(value, lambda item: 0 < item <= 3),
+                "hamming_threshold": lambda value: _is_int(value, lambda item: 0 < item <= 256),
+                "iterations": lambda value: _is_int(value, lambda item: item > 0),
+                "reproj_error_px": lambda value: _is_number(value, lambda item: item > 0.0),
+                "confidence": lambda value: _is_number(value, lambda item: 0.0 < item < 1.0),
+                "min_inliers": lambda value: _is_int(value, lambda item: item >= 4),
+                "max_translation_m": lambda value: _is_number(value, lambda item: item > 0.0),
+                "max_rotation_deg": lambda value: _is_number(value, lambda item: 0.0 < item <= 180.0),
+            })
 
     def set_frontend(self, frontend: IFrontend) -> None:
         self.frontend = frontend
@@ -267,6 +290,69 @@ class LoopClosureManager(ConfigTestable):
         self.geometry_enabled = False
         self.disabled_reason = reason
         Logger.write("error", f"Loop geometric verification disabled: {reason}")
+
+    def set_match_cov_default(self, value: float) -> None:
+        self.match_cov_default = float(value)
+
+    def geometry_sidecar_path(self, loop_frame_idx: int, root: Path | None = None) -> Path:
+        base = self.output_dir if root is None else Path(root)
+        if base is None:
+            raise RuntimeError("loop cache output directory was not configured")
+        return base / "geometry_features_v1" / f"loop_{int(loop_frame_idx):06d}.pt"
+
+    def cache_geometry_features(
+        self,
+        frame: StereoFrame,
+        visual_map_idx: int,
+        *,
+        original_index: torch.Tensor,
+        pixel_uv: torch.Tensor,
+        point_camera: torch.Tensor,
+        depth: torch.Tensor,
+        depth_variance: torch.Tensor,
+        disparity: torch.Tensor,
+        disparity_variance: torch.Tensor,
+    ) -> bool:
+        if not self.cache_enabled or not self.vins_geometry_enabled:
+            return False
+        if self.output_dir is None or self.extractor is None or self.match_cov_default is None:
+            return False
+        metadata = next((
+            item for item in self.records
+            if int(item["sensor_frame_idx"]) == int(frame.frame_idx)
+            and int(item["visual_map_idx"]) == int(visual_map_idx)
+        ), None)
+        if metadata is None:
+            return False
+        target = self.geometry_sidecar_path(int(metadata["loop_frame_idx"]))
+        if target.exists():
+            return False
+        try:
+            returned, descriptors = self.extractor.compute_at(frame.stereo.imageL, pixel_uv)
+            selected = returned.long()
+            disp = disparity.reshape(-1)
+            disp_var = disparity_variance.reshape(-1)
+            def take(value: torch.Tensor) -> torch.Tensor:
+                return value[selected.to(value.device)]
+            selected_disp, selected_disp_var = take(disp), take(disp_var)
+            point_covariance = fixed_point_covariance(
+                pixel_uv, depth, depth_variance, frame.stereo.K, self.match_cov_default,
+            )
+            record = GeometryFeatureRecord(
+                sensor_frame_idx=int(frame.frame_idx), visual_map_idx=int(visual_map_idx),
+                loop_frame_idx=int(metadata["loop_frame_idx"]),
+                orb_config_sha256=self.extractor.config_sha256(),
+                original_index=take(original_index.reshape(-1)), pixel_uv=take(pixel_uv),
+                point_camera=take(point_camera), point_covariance_camera=take(point_covariance),
+                disparity=selected_disp, disparity_variance=selected_disp_var,
+                disparity_valid=torch.isfinite(selected_disp) & torch.isfinite(selected_disp_var)
+                & (selected_disp > 0.0) & (selected_disp_var > 0.0),
+                descriptor=descriptors,
+            )
+            return record.save_if_absent(target)
+        except Exception as error:
+            self._disable_all(f"geometry sidecar failure: {error}")
+            return False
 
     def _handle_cache_failure(self, error: Exception) -> None:
         if self.config.cache_failure_policy == "raise":
@@ -619,6 +705,8 @@ class LoopClosureManager(ConfigTestable):
         if self.output_dir is None:
             Logger.write("warn", "Skip loop geometric verification because output directory is unavailable.")
             return []
+        if self.vins_geometry_enabled:
+            return self._verify_vins_candidates(global_map, queries, record_dir=record_dir)
         if self.frontend is None:
             Logger.write("error", "Skip loop geometric verification because Frontend was not injected.")
             return []
@@ -851,3 +939,150 @@ class LoopClosureManager(ConfigTestable):
             f"{pipeline_name} accepted {len(returned_constraints)} / {len(primary_rows)} candidates.",
         )
         return returned_constraints
+
+    def _load_geometry_sidecar(
+        self, metadata: dict[str, Any], record_root: Path,
+    ) -> GeometryFeatureRecord | None:
+        path = self.geometry_sidecar_path(int(metadata["loop_frame_idx"]), record_root)
+        if not path.is_file() or self.extractor is None:
+            return None
+        try:
+            record = GeometryFeatureRecord.load(path)
+        except Exception:
+            return None
+        valid = (
+            int(record.sensor_frame_idx) == int(metadata["sensor_frame_idx"])
+            and int(record.visual_map_idx) == int(metadata["visual_map_idx"])
+            and int(record.loop_frame_idx) == int(metadata["loop_frame_idx"])
+            and record.orb_config_sha256 == self.extractor.config_sha256()
+        )
+        return record if valid else None
+
+    def _verify_vins_candidates(
+        self,
+        global_map: VisualMap,
+        queries: list[dict[str, Any]],
+        *,
+        record_dir: Path | None = None,
+    ) -> list[LoopConstraint]:
+        if self.output_dir is None or self.match_cov_default is None:
+            Logger.write("warn", "Skip VINS-style loop verification because cache or pixel variance is unavailable.")
+            return []
+        if not all(hasattr(cv2, name) for name in ("solvePnPRansac", "Rodrigues", "SOLVEPNP_ITERATIVE")):
+            Logger.write("warn", "Skip VINS-style loop verification because OpenCV PnP is unavailable.")
+            return []
+        record_root = self.output_dir if record_dir is None else Path(record_dir)
+        metadata_by_loop = self._record_by_loop_idx()
+        poses = global_map.frames.data["pose"].tensor
+        pose_snapshot = poses.detach().clone()
+        fixed_information = fixed_loop_information(self.config.loop_information)
+        rows: list[dict[str, Any]] = []
+        selected_constraints: list[LoopConstraint] = []
+        pgo_fixed_constraints: list[dict[str, Any]] = []
+        pgo_covariance_constraints: list[dict[str, Any]] = []
+        config = self.config.vins_geometry
+
+        for query in queries:
+            current_meta = metadata_by_loop.get(int(query["loop_frame_idx"]))
+            if current_meta is None:
+                continue
+            current_geometry = self._load_geometry_sidecar(current_meta, record_root)
+            current_frame = LoopFrameRecord.load(record_root / current_meta["file"])
+            candidates = sorted(
+                query.get("candidates", []),
+                key=lambda item: (-float(item.get("score", 0.0)), int(item["sensor_frame_idx"])),
+            )[:int(config.max_candidates)]
+            accepted: list[tuple[int, GeometryResult]] = []
+            for candidate in candidates:
+                candidate_meta = metadata_by_loop.get(int(candidate["loop_frame_idx"]))
+                pair_id = f"{int(query['loop_frame_idx'])}:{int(candidate['loop_frame_idx'])}"
+                if current_geometry is None or candidate_meta is None:
+                    rows.append({
+                        "pair_id": pair_id, "status": "rejected",
+                        "reject_code": "geometry_sidecar_unavailable", "geometry_accepted": False,
+                        "information_valid": False, "pgo_comparison_eligible": False,
+                    })
+                    continue
+                candidate_geometry = self._load_geometry_sidecar(candidate_meta, record_root)
+                if candidate_geometry is None:
+                    rows.append({
+                        "pair_id": pair_id, "status": "rejected",
+                        "reject_code": "geometry_sidecar_unavailable", "geometry_accepted": False,
+                        "information_valid": False, "pgo_comparison_eligible": False,
+                    })
+                    continue
+                candidate_frame = LoopFrameRecord.load(record_root / candidate_meta["file"])
+                try:
+                    result = verify_fixed_geometry(
+                        config, query, candidate, current_frame, candidate_frame,
+                        current_geometry, candidate_geometry, pose_snapshot,
+                        self.match_cov_default, fixed_information,
+                    )
+                except Exception as error:
+                    rows.append({
+                        "pair_id": pair_id, "status": "rejected",
+                        "reject_code": "verification_exception", "reject_reason": str(error),
+                        "geometry_accepted": False, "information_valid": False,
+                        "pgo_comparison_eligible": False,
+                    })
+                    continue
+                rows.append(result.row)
+                if result.constraint is not None:
+                    result.row["selected_for_query"] = False
+                    accepted.append((int(candidate["sensor_frame_idx"]), result))
+            if accepted:
+                _, chosen = min(accepted, key=lambda item: item[0])
+                chosen.row["selected_for_query"] = True
+                assert chosen.constraint is not None
+                selected_constraints.append(chosen.constraint)
+                if chosen.covariance_information is not None:
+                    fixed_payload = chosen.constraint.to_dict()
+                    covariance_payload = dict(fixed_payload)
+                    covariance_payload["information"] = (
+                        chosen.covariance_information.detach().cpu().tolist()
+                    )
+                    pgo_fixed_constraints.append(fixed_payload)
+                    pgo_covariance_constraints.append(covariance_payload)
+
+        if not torch.equal(poses, pose_snapshot):
+            raise RuntimeError("VINS-style loop verification modified VisualMap poses")
+        payload = {
+            "schema_version": 1,
+            "mode": "vins_fixed_features_disp_information_observe",
+            "summary": {
+                "attempted_pairs": len(rows),
+                "geometry_accepted_pairs": sum(row.get("geometry_accepted") is True for row in rows),
+                "information_valid_pairs": sum(row.get("information_valid") is True for row in rows),
+                "selected_constraints": len(selected_constraints),
+                "selected_pgo_comparison_edges": sum(
+                    row.get("selected_for_query") is True
+                    and row.get("pgo_comparison_eligible") is True
+                    for row in rows
+                ),
+            },
+            "verifications": rows,
+        }
+        constraints_payload = {
+            "schema_version": 1,
+            "pose_direction": "relative_pose = T_candidate_current = inverse(T_current_candidate)",
+            "information_policy": "fixed_information; covariance information is observe-only",
+            "constraints": [constraint.to_dict() for constraint in selected_constraints],
+        }
+        pgo_fixed_payload = {
+            "schema_version": 1,
+            "information_policy": "fixed_information",
+            "constraints": pgo_fixed_constraints,
+        }
+        pgo_covariance_payload = {
+            "schema_version": 1,
+            "information_policy": "disp_covariance_information_observe",
+            "constraints": pgo_covariance_constraints,
+        }
+        self._write_json_bundle([
+            ("loop_constraints.json", constraints_payload),
+            ("loop_constraints_pgo_fixed.json", pgo_fixed_payload),
+            ("loop_constraints_pgo_covariance.json", pgo_covariance_payload),
+            ("loop_vins_verification.json", payload),
+        ], uuid.uuid4().hex)
+        Logger.write("info", f"VINS-style geometry accepted {len(selected_constraints)} loop constraints.")
+        return selected_constraints
