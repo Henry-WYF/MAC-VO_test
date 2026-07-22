@@ -96,7 +96,8 @@ def test_one_way_hamming_is_strict_and_candidate_unique() -> None:
     ])
     current = geometry_record(current_desc, torch.tensor([3, 2, 1]))
     matches = match_fixed_descriptors(current, candidate, 80)
-    assert [(item.current_local, item.candidate_local) for item in matches] == [(0, 0), (2, 1)]
+    # Equal-distance matches are ordered by stable original indices, not local storage order.
+    assert [(item.current_local, item.candidate_local) for item in matches] == [(2, 1), (0, 0)]
     exactly_80 = geometry_record(torch.cat([
         torch.full((1, 10), 255, dtype=torch.uint8), torch.zeros((1, 22), dtype=torch.uint8)
     ], dim=1))
