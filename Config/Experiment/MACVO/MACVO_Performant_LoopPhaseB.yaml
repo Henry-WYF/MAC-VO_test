@@ -102,7 +102,7 @@ Odometry:
       iterations: 100
       reproj_error_px: 10.0
       confidence: 0.99
-      min_inliers: 26
+      min_inliers: 25
       max_translation_m: 20.0
       max_rotation_deg: 30.0
 
