@@ -241,7 +241,9 @@ class LoopClosureManager(ConfigTestable):
         if hasattr(config, "vins_geometry"):
             _validate_section(config.vins_geometry, {
                 "enabled": lambda value: isinstance(value, bool),
-                "max_candidates": lambda value: _is_int(value, lambda item: 0 < item <= 3),
+                "max_candidates": lambda value: _is_int(
+                    value, lambda item: 0 < item <= int(config.top_k)
+                ),
                 "hamming_threshold": lambda value: _is_int(value, lambda item: 0 < item <= 256),
                 "iterations": lambda value: _is_int(value, lambda item: item > 0),
                 "reproj_error_px": lambda value: _is_number(value, lambda item: item > 0.0),

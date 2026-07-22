@@ -39,7 +39,7 @@ FlowFormerCov 双目/相邻帧估计
 
 ```text
 BoW 高分候选
-→ 取最高分前 3
+→ 取最高分前 10（当前诊断配置，最终数量待控制样本实验确定）
 → 两侧 MAC-VO 最终低方差固定点 ORB descriptor-only 匹配
 → 单向 Hamming < 80，candidate 索引唯一
 → 带只读 VO 初值的 PnP RANSAC

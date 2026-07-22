@@ -87,7 +87,7 @@ Odometry:
 
     geometric_verification:
       enabled: true
-      max_candidates_to_verify: 3
+      max_candidates_to_verify: 10
       min_sensor_gap: 100
       compare_flow_cov_gate: false
 
@@ -95,7 +95,7 @@ Odometry:
     # geometry uses descriptors computed at MAC-VO's final fixed VO points.
     vins_geometry:
       enabled: true
-      max_candidates: 3
+      max_candidates: 10
       hamming_threshold: 80
       iterations: 100
       reproj_error_px: 10.0
