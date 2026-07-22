@@ -20,6 +20,7 @@ from Module.LoopClosure.VINSGeometry import (
     cached_orb_geometry,
     fixed_point_covariance,
     match_fixed_descriptors,
+    match_orbslam_descriptors,
     run_pose_copy_pgo_comparison,
     run_pose_copy_pgo_safety,
     verify_fixed_geometry,
@@ -104,6 +105,103 @@ def test_one_way_hamming_is_strict_and_candidate_unique() -> None:
         torch.full((1, 10), 255, dtype=torch.uint8), torch.zeros((1, 22), dtype=torch.uint8)
     ], dim=1))
     assert match_fixed_descriptors(exactly_80, geometry_record(torch.zeros((1, 32), dtype=torch.uint8)), 80) == []
+
+
+def bit_descriptor(*bits: int) -> torch.Tensor:
+    descriptor = torch.zeros(32, dtype=torch.uint8)
+    for bit in bits:
+        descriptor[bit // 8] |= 1 << (bit % 8)
+    return descriptor
+
+
+def test_orbslam_distance_and_ratio_boundaries() -> None:
+    current = geometry_record(torch.zeros((1, 32), dtype=torch.uint8))
+    accepted_candidate = geometry_record(torch.stack([
+        bit_descriptor(*range(50)), bit_descriptor(*range(100)),
+    ]))
+    accepted, diagnostics = match_orbslam_descriptors(
+        current, accepted_candidate, torch.tensor([0.0]), torch.tensor([0.0, 0.0]),
+    )
+    assert len(accepted) == 1
+    assert diagnostics["after_distance"] == diagnostics["after_ratio"] == 1
+
+    rejected_candidate = geometry_record(torch.stack([
+        bit_descriptor(*range(51)), bit_descriptor(*range(100)),
+    ]))
+    rejected, diagnostics = match_orbslam_descriptors(
+        current, rejected_candidate, torch.tensor([0.0]), torch.tensor([0.0, 0.0]),
+    )
+    assert rejected == []
+    assert diagnostics["after_distance"] == 0
+
+    ratio_boundary = geometry_record(torch.stack([
+        bit_descriptor(*range(45)), bit_descriptor(*range(50)),
+    ]))
+    rejected, diagnostics = match_orbslam_descriptors(
+        current, ratio_boundary, torch.tensor([0.0]), torch.tensor([0.0, 0.0]),
+    )
+    assert rejected == []
+    assert diagnostics["after_distance"] == 1
+    assert diagnostics["after_ratio"] == 0
+
+
+def test_orbslam_candidate_unique_and_orientation_filter_are_deterministic() -> None:
+    descriptors = torch.stack([bit_descriptor(index) for index in range(13)])
+    current = geometry_record(descriptors.clone(), torch.arange(13))
+    candidate = geometry_record(descriptors.clone(), torch.arange(13))
+    current_angles = torch.tensor([0.0] * 11 + [12.0, 24.0])
+    matches, diagnostics = match_orbslam_descriptors(
+        current, candidate, current_angles, torch.zeros(13),
+    )
+    assert diagnostics["after_candidate_unique"] == 13
+    assert diagnostics["after_valid_orientation"] == 13
+    assert diagnostics["selected_orientation_bins"] == [0]
+    assert diagnostics["after_orientation_histogram"] == 11
+    assert [item.current_original for item in matches] == list(range(11))
+
+    duplicate_current = geometry_record(torch.stack([
+        bit_descriptor(0), bit_descriptor(0, 1),
+    ]), torch.tensor([5, 3]))
+    duplicate_candidate = geometry_record(torch.stack([
+        bit_descriptor(0), bit_descriptor(*range(20, 80)),
+    ]), torch.tensor([9, 8]))
+    unique, diagnostics = match_orbslam_descriptors(
+        duplicate_current, duplicate_candidate,
+        torch.zeros(6), torch.zeros(10),
+    )
+    assert diagnostics["after_ratio"] == 2
+    assert diagnostics["after_candidate_unique"] == 1
+    assert unique[0].current_original == 5
+
+
+def test_orbslam_orientation_wrap_half_bin_and_invalid_point_filter() -> None:
+    descriptors = torch.stack([bit_descriptor(index) for index in range(3)])
+    record = geometry_record(descriptors)
+    matches, diagnostics = match_orbslam_descriptors(
+        record, record,
+        torch.tensor([359.0, 6.0, -1.0]), torch.tensor([5.0, 0.0, 0.0]),
+    )
+    assert diagnostics["invalid_orientation_matches"] == 1
+    assert diagnostics["after_valid_orientation"] == 2
+    assert diagnostics["selected_orientation_bins"] == [0, 1]
+    assert len(matches) == 2
+
+    four = geometry_record(torch.stack([bit_descriptor(index) for index in range(4)]))
+    _, tied = match_orbslam_descriptors(
+        four, four, torch.tensor([0.0, 12.0, 24.0, 36.0]), torch.zeros(4),
+    )
+    assert tied["selected_orientation_bins"] == [0, 1, 2]
+    assert tied["after_orientation_histogram"] == 3
+
+
+def test_orbslam_requires_a_second_candidate_descriptor() -> None:
+    matches, diagnostics = match_orbslam_descriptors(
+        geometry_record(torch.zeros((1, 32), dtype=torch.uint8)),
+        geometry_record(torch.zeros((1, 32), dtype=torch.uint8)),
+        torch.tensor([0.0]), torch.tensor([0.0]),
+    )
+    assert matches == []
+    assert diagnostics["reject_code"] == "insufficient_second_neighbor"
 
 
 def test_fixed_point_orb_compute_restores_class_ids_without_detection(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -210,6 +308,17 @@ def test_cached_orb_geometry_rejects_invalid_cache_layout(
     record, error, _ = cached_orb_geometry(frame, 0.25)
     assert record is None
     assert error == expected
+
+
+def test_cached_orb_geometry_requires_angle_column_only_for_orbslam() -> None:
+    K = torch.tensor([[[100.0, 0.0, 50.0], [0.0, 100.0, 40.0], [0.0, 0.0, 1.0]]])
+    frame = loop_frame(20, 1, 1, K)
+    frame.orb_keypoints = torch.tensor([[10.0, 20.0]])
+    frame.orb_descriptors = torch.zeros((1, 32), dtype=torch.uint8)
+    legacy, legacy_error, _ = cached_orb_geometry(frame, 0.25)
+    strict, strict_error, _ = cached_orb_geometry(frame, 0.25, require_orientation=True)
+    assert legacy is not None and legacy_error is None
+    assert strict is None and strict_error == "invalid_orb_cache_layout"
 
 
 def test_invalid_candidate_covariance_does_not_reject_pnp(

@@ -15,7 +15,13 @@ import torch
 
 from Module.Frontend.Frontend import IFrontend
 from Module.LoopClosure import LoopClosureManager, LoopFrameRecord
-from Module.LoopClosure.VINSGeometry import run_pose_copy_pgo_comparison
+from Module.LoopClosure.VINSGeometry import (
+    ORB_SLAM_HAMMING_THRESHOLD,
+    ORB_SLAM_ORIENTATION_BINS,
+    ORB_SLAM_ORIENTATION_WEAK_BIN_RATIO,
+    ORB_SLAM_RATIO_THRESHOLD,
+    run_pose_copy_pgo_comparison,
+)
 from Module.Map import VisualMap
 from Module.Optimization.GlobalPGO import GlobalPoseGraphOptimizer
 from Utility.Config import load_config
@@ -511,6 +517,10 @@ def _parse_args() -> argparse.Namespace:
         "--vins-feature-source", choices=("fixed_covariance", "orb_detected"),
         help="Override the VINS-style local geometry feature source in memory.",
     )
+    parser.add_argument(
+        "--vins-descriptor-match-mode", choices=("vins_legacy", "orbslam"),
+        help="Override the VINS-style descriptor matcher in memory.",
+    )
     return parser.parse_args()
 
 
@@ -536,6 +546,10 @@ def main() -> None:
         if not hasattr(loop_config, "vins_geometry"):
             raise ValueError("--vins-feature-source requires a vins_geometry configuration")
         loop_config.vins_geometry.feature_source = args.vins_feature_source
+    if args.vins_descriptor_match_mode is not None:
+        if not hasattr(loop_config, "vins_geometry"):
+            raise ValueError("--vins-descriptor-match-mode requires a vins_geometry configuration")
+        loop_config.vins_geometry.descriptor_match_mode = args.vins_descriptor_match_mode
     if not vins_mode:
         loop_config.geometry.flow_cov_gate_enabled = args.primary_gate == "enabled"
         # Explicitly override the YAML so an omitted CLI option always means the fixed baseline.
@@ -695,6 +709,27 @@ def main() -> None:
         "vins_geometry_feature_source": (
             getattr(loop_config.vins_geometry, "feature_source", "fixed_covariance")
             if hasattr(loop_config, "vins_geometry") else None
+        ),
+        "vins_geometry_descriptor_match_mode": (
+            getattr(loop_config.vins_geometry, "descriptor_match_mode", "vins_legacy")
+            if hasattr(loop_config, "vins_geometry") else None
+        ),
+        "vins_geometry_descriptor_match_parameters": (
+            {
+                "distance_threshold_inclusive": ORB_SLAM_HAMMING_THRESHOLD,
+                "ratio_threshold_strict": ORB_SLAM_RATIO_THRESHOLD,
+                "orientation_filter": "simplified_orbslam_orientation_histogram",
+                "orientation_histogram_bins": ORB_SLAM_ORIENTATION_BINS,
+                "orientation_weak_bin_ratio": ORB_SLAM_ORIENTATION_WEAK_BIN_RATIO,
+            }
+            if hasattr(loop_config, "vins_geometry")
+            and getattr(loop_config.vins_geometry, "descriptor_match_mode", "vins_legacy") == "orbslam"
+            else {
+                "distance_threshold_strict": (
+                    getattr(loop_config.vins_geometry, "hamming_threshold", None)
+                    if hasattr(loop_config, "vins_geometry") else None
+                )
+            }
         ),
         "configured_frontend_type": configured_frontend_type,
         "runtime_frontend_type": runtime_frontend_type,

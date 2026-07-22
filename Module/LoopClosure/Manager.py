@@ -254,7 +254,14 @@ class LoopClosureManager(ConfigTestable):
                 "max_rotation_deg": lambda value: _is_number(value, lambda item: 0.0 < item <= 180.0),
             }, {
                 "feature_source": lambda value: value in {"fixed_covariance", "orb_detected"},
+                "descriptor_match_mode": lambda value: value in {"vins_legacy", "orbslam"},
             })
+            feature_source = getattr(config.vins_geometry, "feature_source", "fixed_covariance")
+            descriptor_match_mode = getattr(
+                config.vins_geometry, "descriptor_match_mode", "vins_legacy"
+            )
+            if descriptor_match_mode == "orbslam" and feature_source != "orb_detected":
+                raise ValueError("descriptor_match_mode=orbslam requires feature_source=orb_detected")
 
     def set_frontend(self, frontend: IFrontend) -> None:
         self.frontend = frontend
@@ -995,6 +1002,7 @@ class LoopClosureManager(ConfigTestable):
         pgo_covariance_constraints: list[dict[str, Any]] = []
         config = self.config.vins_geometry
         feature_source = str(getattr(config, "feature_source", "fixed_covariance"))
+        descriptor_match_mode = str(getattr(config, "descriptor_match_mode", "vins_legacy"))
         geometry_cache: dict[int, tuple[GeometryFeatureRecord | None, str | None, dict[str, Any]]] = {}
 
         def load_geometry(
@@ -1004,7 +1012,10 @@ class LoopClosureManager(ConfigTestable):
             if loop_idx in geometry_cache:
                 return geometry_cache[loop_idx]
             if feature_source == "orb_detected":
-                loaded = cached_orb_geometry(frame, self.match_cov_default)
+                loaded = cached_orb_geometry(
+                    frame, self.match_cov_default,
+                    require_orientation=descriptor_match_mode == "orbslam",
+                )
             else:
                 record = self._load_geometry_sidecar(metadata, record_root)
                 loaded = (
@@ -1036,6 +1047,7 @@ class LoopClosureManager(ConfigTestable):
                         "pair_id": pair_id, "status": "rejected",
                         "reject_code": current_error or "geometry_cache_metadata_unavailable",
                         "feature_source": feature_source,
+                        "descriptor_match_mode": descriptor_match_mode,
                         "current_orb": current_diagnostics,
                         "geometry_accepted": False,
                         "information_valid": False, "pgo_comparison_eligible": False,
@@ -1050,6 +1062,7 @@ class LoopClosureManager(ConfigTestable):
                         "pair_id": pair_id, "status": "rejected",
                         "reject_code": candidate_error or "geometry_sidecar_unavailable",
                         "feature_source": feature_source,
+                        "descriptor_match_mode": descriptor_match_mode,
                         "current_orb": current_diagnostics,
                         "candidate_orb": candidate_diagnostics,
                         "geometry_accepted": False,
@@ -1067,6 +1080,7 @@ class LoopClosureManager(ConfigTestable):
                         "pair_id": pair_id, "status": "rejected",
                         "reject_code": "verification_exception", "reject_reason": str(error),
                         "feature_source": feature_source,
+                        "descriptor_match_mode": descriptor_match_mode,
                         "current_orb": current_diagnostics,
                         "candidate_orb": candidate_diagnostics,
                         "geometry_accepted": False, "information_valid": False,
@@ -1075,6 +1089,7 @@ class LoopClosureManager(ConfigTestable):
                     continue
                 result.row.update({
                     "feature_source": feature_source,
+                    "descriptor_match_mode": descriptor_match_mode,
                     "current_orb": current_diagnostics,
                     "candidate_orb": candidate_diagnostics,
                 })
@@ -1102,6 +1117,7 @@ class LoopClosureManager(ConfigTestable):
             "schema_version": 1,
             "mode": "vins_geometry_disp_information_observe",
             "feature_source": feature_source,
+            "descriptor_match_mode": descriptor_match_mode,
             "summary": {
                 "attempted_pairs": len(rows),
                 "geometry_accepted_pairs": sum(row.get("geometry_accepted") is True for row in rows),
@@ -1118,6 +1134,7 @@ class LoopClosureManager(ConfigTestable):
         constraints_payload = {
             "schema_version": 1,
             "feature_source": feature_source,
+            "descriptor_match_mode": descriptor_match_mode,
             "pose_direction": "relative_pose = T_candidate_current = inverse(T_current_candidate)",
             "information_policy": "fixed_information; covariance information is observe-only",
             "constraints": [constraint.to_dict() for constraint in selected_constraints],
@@ -1125,12 +1142,14 @@ class LoopClosureManager(ConfigTestable):
         pgo_fixed_payload = {
             "schema_version": 1,
             "feature_source": feature_source,
+            "descriptor_match_mode": descriptor_match_mode,
             "information_policy": "fixed_information",
             "constraints": pgo_fixed_constraints,
         }
         pgo_covariance_payload = {
             "schema_version": 1,
             "feature_source": feature_source,
+            "descriptor_match_mode": descriptor_match_mode,
             "information_policy": "disp_covariance_information_observe",
             "constraints": pgo_covariance_constraints,
         }

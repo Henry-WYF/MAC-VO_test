@@ -91,11 +91,12 @@ Odometry:
       min_sensor_gap: 100
       compare_flow_cov_gate: false
 
-    # Low-intrusion VINS-style verification. This experiment reuses the cached
-    # detected ORB points for local matching and samples their dense stereo depth.
+    # Low-intrusion geometry verification. This experiment reuses cached detected
+    # ORB points and applies an ORB-SLAM-inspired descriptor filter before PnP.
     vins_geometry:
       enabled: true
       feature_source: orb_detected
+      descriptor_match_mode: orbslam
       max_candidates: 10
       hamming_threshold: 80
       iterations: 100

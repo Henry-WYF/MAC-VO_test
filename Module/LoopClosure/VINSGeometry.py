@@ -23,6 +23,10 @@ from .Verification import LoopConstraint
 
 _NED_TO_CV = np.asarray([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]], dtype=np.float64)
 _BIT_COUNTS = np.asarray([int(index).bit_count() for index in range(256)], dtype=np.uint8)
+ORB_SLAM_HAMMING_THRESHOLD = 50
+ORB_SLAM_RATIO_THRESHOLD = 0.9
+ORB_SLAM_ORIENTATION_BINS = 30
+ORB_SLAM_ORIENTATION_WEAK_BIN_RATIO = 0.1
 
 
 @dataclass(frozen=True)
@@ -44,6 +48,8 @@ class GeometryResult:
 def cached_orb_geometry(
     frame: LoopFrameRecord,
     pixel_variance: float,
+    *,
+    require_orientation: bool = False,
 ) -> tuple[GeometryFeatureRecord | None, str | None, dict[str, Any]]:
     """Adapt cached detected ORB points to the existing geometry verifier in memory."""
     keypoints = frame.orb_keypoints
@@ -54,7 +60,7 @@ def cached_orb_geometry(
         "disparity_variance_source": "derived_from_cached_depth_covariance",
     }
     valid_layout = (
-        keypoints.ndim == 2 and keypoints.shape[1] >= 2
+        keypoints.ndim == 2 and keypoints.shape[1] >= (4 if require_orientation else 2)
         and keypoints.dtype.is_floating_point
         and descriptors.ndim == 2 and descriptors.shape[1] == 32
         and descriptors.dtype == torch.uint8
@@ -193,6 +199,117 @@ def match_fixed_descriptors(
         used_candidate.add(item.candidate_local)
         unique.append(item)
     return unique
+
+
+def match_orbslam_descriptors(
+    current: GeometryFeatureRecord,
+    candidate: GeometryFeatureRecord,
+    current_angles: torch.Tensor,
+    candidate_angles: torch.Tensor,
+) -> tuple[list[FixedMatch], dict[str, Any]]:
+    """ORB-SLAM-inspired global NN matching with deterministic orientation filtering."""
+    current_desc = current.descriptor.detach().cpu().numpy().astype(np.uint8, copy=False)
+    candidate_desc = candidate.descriptor.detach().cpu().numpy().astype(np.uint8, copy=False)
+    diagnostics: dict[str, Any] = {
+        "descriptor_match_mode": "orbslam",
+        "descriptors": {"current": int(len(current_desc)), "candidate": int(len(candidate_desc))},
+        "distance_threshold_inclusive": ORB_SLAM_HAMMING_THRESHOLD,
+        "ratio_threshold_strict": ORB_SLAM_RATIO_THRESHOLD,
+        "orientation_filter": "simplified_orbslam_orientation_histogram",
+        "orientation_histogram_bins": ORB_SLAM_ORIENTATION_BINS,
+        "orientation_weak_bin_ratio": ORB_SLAM_ORIENTATION_WEAK_BIN_RATIO,
+        "after_distance": 0,
+        "after_ratio": 0,
+        "after_candidate_unique": 0,
+        "after_valid_orientation": 0,
+        "after_orientation_histogram": 0,
+        "invalid_orientation_matches": 0,
+        "selected_orientation_bins": [],
+    }
+    if (
+        current_desc.ndim != 2 or candidate_desc.ndim != 2
+        or not len(current_desc) or not len(candidate_desc)
+    ):
+        return [], diagnostics
+    if len(candidate_desc) < 2:
+        diagnostics["reject_code"] = "insufficient_second_neighbor"
+        return [], diagnostics
+
+    candidate_original = candidate.original_index.detach().cpu().numpy().astype(np.int64, copy=False)
+    proposed: list[FixedMatch] = []
+    for current_local, descriptor in enumerate(current_desc):
+        distances = _BIT_COUNTS[np.bitwise_xor(candidate_desc, descriptor)].sum(axis=1)
+        order = np.lexsort((candidate_original, distances))
+        best_local, second_local = int(order[0]), int(order[1])
+        best_distance = int(distances[best_local])
+        second_distance = int(distances[second_local])
+        if best_distance > ORB_SLAM_HAMMING_THRESHOLD:
+            continue
+        diagnostics["after_distance"] += 1
+        if not best_distance < ORB_SLAM_RATIO_THRESHOLD * second_distance:
+            continue
+        diagnostics["after_ratio"] += 1
+        proposed.append(FixedMatch(
+            distance=best_distance,
+            current_local=current_local,
+            candidate_local=best_local,
+            current_original=int(current.original_index[current_local]),
+            candidate_original=int(candidate.original_index[best_local]),
+        ))
+
+    proposed.sort(key=lambda item: (item.distance, item.current_original, item.candidate_original))
+    used_candidate: set[int] = set()
+    unique: list[FixedMatch] = []
+    for item in proposed:
+        if item.candidate_local in used_candidate:
+            continue
+        used_candidate.add(item.candidate_local)
+        unique.append(item)
+    diagnostics["after_candidate_unique"] = len(unique)
+
+    current_angle_values = current_angles.detach().cpu().reshape(-1).double()
+    candidate_angle_values = candidate_angles.detach().cpu().reshape(-1).double()
+    valid_oriented: list[tuple[FixedMatch, int]] = []
+    histogram = [0] * ORB_SLAM_ORIENTATION_BINS
+    for item in unique:
+        if (
+            item.current_original < 0 or item.current_original >= len(current_angle_values)
+            or item.candidate_original < 0 or item.candidate_original >= len(candidate_angle_values)
+        ):
+            diagnostics["invalid_orientation_matches"] += 1
+            continue
+        current_angle = float(current_angle_values[item.current_original])
+        candidate_angle = float(candidate_angle_values[item.candidate_original])
+        if not (
+            math.isfinite(current_angle) and math.isfinite(candidate_angle)
+            and 0.0 <= current_angle < 360.0 and 0.0 <= candidate_angle < 360.0
+        ):
+            diagnostics["invalid_orientation_matches"] += 1
+            continue
+        delta = (current_angle - candidate_angle) % 360.0
+        bin_width = 360.0 / ORB_SLAM_ORIENTATION_BINS
+        bin_index = (
+            int(math.floor(delta / bin_width + 0.5)) % ORB_SLAM_ORIENTATION_BINS
+        )
+        histogram[bin_index] += 1
+        valid_oriented.append((item, bin_index))
+    diagnostics["after_valid_orientation"] = len(valid_oriented)
+    populated = sorted(
+        ((count, index) for index, count in enumerate(histogram) if count > 0),
+        key=lambda value: (-value[0], value[1]),
+    )[:3]
+    selected_bins: list[int] = []
+    if populated:
+        maximum = populated[0][0]
+        selected_bins = [
+            index for count, index in populated
+            if count >= ORB_SLAM_ORIENTATION_WEAK_BIN_RATIO * maximum
+        ]
+    selected = set(selected_bins)
+    matches = [item for item, bin_index in valid_oriented if bin_index in selected]
+    diagnostics["selected_orientation_bins"] = selected_bins
+    diagnostics["after_orientation_histogram"] = len(matches)
+    return matches, diagnostics
 
 
 def _pose_matrix(pose: pp.LieTensor | torch.Tensor) -> np.ndarray:
@@ -334,7 +451,35 @@ def verify_fixed_geometry(
         "bow_score": float(candidate.get("score", 0.0)),
     }
 
-    matches = match_fixed_descriptors(current, historical, int(config.hamming_threshold))
+    descriptor_match_mode = str(getattr(config, "descriptor_match_mode", "vins_legacy"))
+    if descriptor_match_mode == "orbslam":
+        matches, matching = match_orbslam_descriptors(
+            current, historical,
+            current_frame.orb_keypoints[:, 3], candidate_frame.orb_keypoints[:, 3],
+        )
+        row.update(matching)
+        if matching.get("reject_code") == "insufficient_second_neighbor":
+            row.update({
+                "reject_code": "insufficient_second_neighbor",
+                "unique_descriptor_matches": 0,
+                "elapsed_ms": (time.perf_counter() - started) * 1000.0,
+            })
+            return GeometryResult(row, None, None)
+    else:
+        matches = match_fixed_descriptors(current, historical, int(config.hamming_threshold))
+        row.update({
+            "descriptor_match_mode": "vins_legacy",
+            "descriptors": {
+                "current": int(len(current.descriptor)),
+                "candidate": int(len(historical.descriptor)),
+            },
+            "after_distance": None,
+            "after_ratio": None,
+            "after_candidate_unique": len(matches),
+            "after_valid_orientation": None,
+            "after_orientation_histogram": None,
+            "orientation_filter": None,
+        })
     row["unique_descriptor_matches"] = len(matches)
     if len(matches) < 4:
         row.update({"reject_code": "insufficient_descriptor_matches", "elapsed_ms": (time.perf_counter() - started) * 1000.0})

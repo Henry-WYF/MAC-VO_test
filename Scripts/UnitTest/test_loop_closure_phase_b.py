@@ -84,7 +84,10 @@ def make_config(
     )
 
 
-def vins_geometry_config(feature_source: str | None = None) -> SimpleNamespace:
+def vins_geometry_config(
+    feature_source: str | None = None,
+    descriptor_match_mode: str | None = None,
+) -> SimpleNamespace:
     config = SimpleNamespace(
         enabled=True, max_candidates=10, hamming_threshold=80, iterations=100,
         reproj_error_px=10.0, confidence=0.99, min_inliers=26,
@@ -92,6 +95,8 @@ def vins_geometry_config(feature_source: str | None = None) -> SimpleNamespace:
     )
     if feature_source is not None:
         config.feature_source = feature_source
+    if descriptor_match_mode is not None:
+        config.descriptor_match_mode = descriptor_match_mode
     return config
 
 
@@ -112,6 +117,27 @@ def test_vins_feature_source_is_optional_and_controls_sidecar(tmp_path: Path) ->
     invalid.vins_geometry = vins_geometry_config("unknown")
     with pytest.raises(ValueError):
         LoopClosureManager.is_valid_config(invalid)
+
+    orbslam = make_config(tmp_path)
+    orbslam.vins_geometry = vins_geometry_config("orb_detected", "orbslam")
+    LoopClosureManager.is_valid_config(orbslam)
+
+    # Mirror the offline CLI sequence: start from the YAML's valid ORB-SLAM
+    # combination, override only the feature source, then validate the effective config.
+    incompatible = make_config(tmp_path)
+    incompatible.vins_geometry = vins_geometry_config("orb_detected", "orbslam")
+    incompatible.vins_geometry.feature_source = "fixed_covariance"
+    with pytest.raises(ValueError):
+        LoopClosureManager.is_valid_config(incompatible)
+
+    fixed_baseline = make_config(tmp_path)
+    fixed_baseline.vins_geometry = vins_geometry_config("fixed_covariance", "vins_legacy")
+    LoopClosureManager.is_valid_config(fixed_baseline)
+
+    invalid_matcher = make_config(tmp_path)
+    invalid_matcher.vins_geometry = vins_geometry_config("orb_detected", "unknown")
+    with pytest.raises(ValueError):
+        LoopClosureManager.is_valid_config(invalid_matcher)
 
 
 def make_record(sensor_idx: int, visual_idx: int, loop_idx: int, height: int = 12, width: int = 12) -> LoopFrameRecord:
