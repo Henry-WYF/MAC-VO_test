@@ -346,6 +346,16 @@ def _cv_pose_to_ned(rvec: np.ndarray, tvec: np.ndarray) -> pp.LieTensor:
 
 def _pose_magnitude(pose: pp.LieTensor) -> tuple[float, float]:
     matrix = pose.matrix().detach().cpu().double()
+    if matrix.ndim == 3:
+        if matrix.shape[0] != 1:
+            raise ValueError(
+                f"_pose_magnitude expects one pose, got batch size {matrix.shape[0]}"
+            )
+        matrix = matrix[0]
+    if matrix.shape != (4, 4):
+        raise ValueError(
+            f"_pose_magnitude expects a 4x4 pose matrix, got {tuple(matrix.shape)}"
+        )
     translation = float(torch.linalg.vector_norm(matrix[:3, 3]))
     trace = float(torch.trace(matrix[:3, :3]))
     angle = math.degrees(math.acos(max(-1.0, min(1.0, (trace - 1.0) * 0.5))))

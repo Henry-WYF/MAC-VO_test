@@ -17,6 +17,7 @@ from Module.LoopClosure.VINSGeometry import (
     GeometryResult,
     _cv_pose_to_ned,
     _ned_pose_to_cv,
+    _pose_magnitude,
     _strict_information,
     cached_orb_geometry,
     fixed_point_covariance,
@@ -201,6 +202,15 @@ def test_geometry_sidecar_first_write_is_atomic_and_not_overwritten(tmp_path: Pa
     loaded = GeometryFeatureRecord.load(path)
     assert torch.equal(loaded.descriptor, first.descriptor)
     assert not path.with_suffix(".pt.tmp").exists()
+
+
+def test_pose_magnitude_accepts_singleton_pose_batch() -> None:
+    translation, rotation = _pose_magnitude(pp.identity_SE3(1))
+    assert translation == pytest.approx(0.0)
+    assert rotation == pytest.approx(0.0)
+
+    with pytest.raises(ValueError, match="expects one pose"):
+        _pose_magnitude(pp.identity_SE3(2))
 
 
 def test_one_way_hamming_is_strict_and_candidate_unique() -> None:
