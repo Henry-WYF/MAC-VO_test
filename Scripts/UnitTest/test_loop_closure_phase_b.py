@@ -140,6 +140,35 @@ def test_vins_feature_source_is_optional_and_controls_sidecar(tmp_path: Path) ->
         LoopClosureManager.is_valid_config(invalid_matcher)
 
 
+def test_vins_network_refinement_is_optional_and_validated(tmp_path: Path) -> None:
+    legacy = make_config(tmp_path)
+    legacy.vins_geometry = vins_geometry_config("orb_detected", "orbslam")
+    LoopClosureManager.is_valid_config(legacy)
+
+    enabled = make_config(tmp_path)
+    enabled.vins_geometry = vins_geometry_config("orb_detected", "orbslam")
+    enabled.vins_geometry.network_refinement = SimpleNamespace(
+        enabled=True,
+        min_points=6,
+        huber_delta=2.795,
+        max_iterations=15,
+        damping_initial=1e-3,
+    )
+    LoopClosureManager.is_valid_config(enabled)
+
+    invalid = make_config(tmp_path)
+    invalid.vins_geometry = vins_geometry_config("orb_detected", "orbslam")
+    invalid.vins_geometry.network_refinement = SimpleNamespace(
+        enabled=True,
+        min_points=5,
+        huber_delta=2.795,
+        max_iterations=15,
+        damping_initial=1e-3,
+    )
+    with pytest.raises(ValueError):
+        LoopClosureManager.is_valid_config(invalid)
+
+
 def make_record(sensor_idx: int, visual_idx: int, loop_idx: int, height: int = 12, width: int = 12) -> LoopFrameRecord:
     image = torch.zeros((1, 3, height, width), dtype=torch.float32)
     intrinsic = torch.tensor(

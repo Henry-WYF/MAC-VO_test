@@ -38,6 +38,25 @@ def make_config(**overrides) -> SimpleNamespace:
     return SimpleNamespace(**values)
 
 
+def make_sparse_config(**overrides) -> SimpleNamespace:
+    values = {
+        "solver": "sparse_lm",
+        "loop_huber_delta": 3.548,
+        "observation_huber_delta": 2.795,
+        "sparse_lm": SimpleNamespace(
+            initial_damping=1e-3,
+            min_damping=1e-9,
+            max_damping=1e9,
+            damping_up=10.0,
+            damping_down=3.0,
+            max_trials=5,
+            jacobian_epsilon=1e-6,
+        ),
+    }
+    values.update(overrides)
+    return make_config(**values)
+
+
 def make_pose_chain(num_poses: int) -> torch.Tensor:
     poses = torch.zeros((num_poses, 7), dtype=torch.float32)
     poses[:, 0] = torch.arange(num_poses, dtype=torch.float32)
@@ -141,3 +160,51 @@ def test_write_back_preserves_pose_shape_and_dtype() -> None:
     assert global_map.frames.data["pose"].shape == poses.shape
     assert global_map.frames.data["pose"].dtype == torch.float32
     assert torch.allclose(global_map.frames.data["pose"], optimized.float())
+
+
+def test_sparse_lm_reduces_robust_loss_and_keeps_first_pose() -> None:
+    pytest.importorskip("scipy")
+    target = make_pose_chain(5)
+    perturbed = target.clone()
+    perturbed[1:, 0] += torch.tensor([0.25, -0.2, 0.35, -0.15])
+    optimizer = GlobalPoseGraphOptimizer(make_sparse_config(max_iterations=20))
+    optimizer.register_odometry_edges(FakeMap(target))
+    optimizer.add_loop_edge(
+        0, 4, relative_pose(pp.SE3(target[0]), pp.SE3(target[4])),
+    )
+    before = optimizer.compute_loss(perturbed)
+    optimized = optimizer.optimize_poses(perturbed)
+    after = optimizer.compute_loss(optimized)
+    assert after < before
+    assert torch.equal(optimized[0], perturbed[0])
+    assert optimizer.last_optimization_diagnostics["safe"] is True
+    assert optimizer.last_optimization_diagnostics["trajectory_source"] == "optimized"
+
+
+def test_sparse_lm_zero_residual_is_safe_noop() -> None:
+    pytest.importorskip("scipy")
+    poses = make_pose_chain(4)
+    optimizer = GlobalPoseGraphOptimizer(make_sparse_config(max_iterations=5))
+    optimizer.register_odometry_edges(FakeMap(poses))
+    optimized = optimizer.optimize_poses(poses)
+    assert torch.allclose(optimized, poses)
+    assert optimizer.last_optimization_diagnostics["safe"] is True
+
+
+def test_mixed_odometry_information_uses_explicit_fixed_fallback() -> None:
+    poses = make_pose_chain(4)
+    optimizer = GlobalPoseGraphOptimizer(make_sparse_config())
+    optimizer.register_odometry_edges(
+        FakeMap(poses), information_mode="mixed_covariance_fixed",
+    )
+    assert len(optimizer.odometry_information_diagnostics) == 3
+    assert all(
+        row["fallback"] is True
+        and row["used_mode"] == "fixed_information"
+        and row["fallback_reason"]
+        for row in optimizer.odometry_information_diagnostics
+    )
+    assert all(
+        torch.equal(edge.information, optimizer.default_information())
+        for edge in optimizer.edges
+    )

@@ -227,8 +227,10 @@ def build_pgo_pair(
 ) -> tuple[GlobalPoseGraphOptimizer, GlobalPoseGraphOptimizer]:
     fixed_optimizer = GlobalPoseGraphOptimizer(config)
     covariance_optimizer = GlobalPoseGraphOptimizer(config)
-    fixed_optimizer.register_odometry_edges(global_map)
-    covariance_optimizer.register_odometry_edges(global_map)
+    fixed_optimizer.register_odometry_edges(global_map, "fixed")
+    covariance_optimizer.register_odometry_edges(
+        global_map, "mixed_covariance_fixed",
+    )
     for fixed, covariance in zip(fixed_rows, covariance_rows):
         if _edge_key(fixed) != _edge_key(covariance) or fixed["relative_pose"] != covariance["relative_pose"]:
             raise ValueError("fixed/covariance loop edge identity differs")
@@ -545,12 +547,20 @@ def main() -> None:
             "pair_id": verification_row["pair_id"],
             "src_sensor_frame_idx": fixed_row["src_sensor_frame_idx"],
             "dst_sensor_frame_idx": fixed_row["dst_sensor_frame_idx"],
-            "rank": information["rank"],
-            "raw_eigenvalues": information["raw_eigenvalues"],
-            "used_eigenvalues": information["edge_eigenvalues"],
-            "generalized_lambda_max": information["generalized_lambda_max"],
-            "alpha": information["alpha"],
+            "rank": information.get("rank"),
+            "point_count": information.get("point_count"),
+            "trace": information.get("trace"),
+            "trace_per_point": information.get("trace_per_point"),
+            "condition_number": information.get("condition_number"),
+            "raw_eigenvalues": information.get("raw_eigenvalues"),
+            "used_eigenvalues": information.get("edge_eigenvalues"),
+            "generalized_lambda_max": information.get("generalized_lambda_max"),
+            "alpha": information.get("alpha"),
         })
+    odometry_diagnostics = covariance_optimizer.odometry_information_diagnostics
+    odometry_fallback = [
+        row for row in odometry_diagnostics if row.get("fallback") is True
+    ]
     comparison = {
         "schema_version": 1,
         **common_metadata,
@@ -564,7 +574,9 @@ def main() -> None:
         },
         "policy": {
             "no_loop_registers_loop_edges": False,
-            "huber_enabled": False,
+            "huber_enabled": getattr(pgo_config, "solver", "lbfgs") == "sparse_lm",
+            "global_solver": getattr(pgo_config, "solver", "lbfgs"),
+            "covariance_branch_semantics": "mixed_covariance_fixed_information",
             "pose_matrix_atol": POSE_ATOL,
             "pose_matrix_rtol": POSE_RTOL,
             "metric_tolerance": "max(1e-9, 1e-6 * abs(baseline))",
@@ -572,6 +584,16 @@ def main() -> None:
         },
         "loop_edge_count": len(fixed_rows),
         "edge_diagnostics": edge_diagnostics,
+        "odometry_information": {
+            "total_edges": len(odometry_diagnostics),
+            "observation_hessian_edges": (
+                len(odometry_diagnostics) - len(odometry_fallback)
+            ),
+            "fallback_edges": len(odometry_fallback),
+            "fallback_ratio": len(odometry_fallback)
+            / max(len(odometry_diagnostics), 1),
+            "fallback_details": odometry_fallback,
+        },
         "original_pose_invariant": original_pose_invariant,
         "branches": {
             "no_loop": {

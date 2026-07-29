@@ -30,6 +30,10 @@ from Scripts.AdHoc.RunLoopPhaseBOffline import (
     summarize_engineering_admission,
 )
 from Module.Map import VisualMap
+from Module.Optimization.ObservationInformation import (
+    information_diagnostics,
+    robust_observation_system,
+)
 from Utility.Point import pixel2point_NED
 
 
@@ -429,6 +433,44 @@ def test_disp_information_checks_stacked_rank_and_only_downweights() -> None:
     )
     assert single["rank"] <= 3
     assert single["valid"] is False
+
+
+def test_robust_observation_information_uses_covariance_sum_and_is_full_rank() -> None:
+    points = torch.tensor([
+        [2.0, -0.5, -0.3], [2.2, 0.4, -0.2], [2.5, -0.3, 0.4],
+        [3.0, 0.5, 0.3], [3.5, -0.6, 0.2], [4.0, 0.2, -0.4],
+    ], dtype=torch.float64)
+    K = torch.tensor(
+        [[100., 0., 50.], [0., 100., 40.], [0., 0., 1.]],
+        dtype=torch.float64,
+    )
+    uv = torch.stack([
+        100. * points[:, 1] / points[:, 0] + 50.,
+        100. * points[:, 2] / points[:, 0] + 40.,
+    ], dim=-1)
+    system = robust_observation_system(
+        pp.identity_SE3(1).double(),
+        points,
+        torch.eye(3, dtype=torch.float64).repeat(len(points), 1, 1) * 1e-3,
+        uv,
+        torch.eye(2, dtype=torch.float64).repeat(len(points), 1, 1) * 0.25,
+        20.0 / points[:, 0],
+        torch.full((len(points),), 0.1, dtype=torch.float64),
+        K,
+        torch.tensor([0.2], dtype=torch.float64),
+        2.795,
+    )
+    # Measurement and projected candidate covariance are added, never subtracted.
+    assert torch.all(
+        torch.diagonal(system.covariance, dim1=-2, dim2=-1)
+        > torch.tensor([0.25, 0.25, 0.1], dtype=torch.float64)
+    )
+    information, diagnostics = information_diagnostics(
+        system, pp.identity_SE3(1).double(), point_count=len(points),
+    )
+    assert information is not None
+    assert diagnostics["rank"] == 6
+    assert diagnostics["normalization"] == "raw_robust_hessian_no_lm_damping"
 
 
 def test_pose_copy_safety_rejects_loss_increase() -> None:

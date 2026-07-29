@@ -1,17 +1,18 @@
 # MAC-VO 项目上下文
 
-> 供新 Agent 快速接手。最后更新：2026-07-23。
+> 供新 Agent 快速接手。最后更新：2026-07-30。
 
 ## 1. 当前状态
 
 | 项目 | 状态 |
 |---|---|
 | 仓库 / 分支 | `MAC-VO-test` / `agent-a-codex/loop-geometric-verification` |
-| Phase C 基线提交 | `7ca8970` |
-| 地点识别 | 默认 `custom_binary`；DBoW2 保留为可切换后端，但当前审核集未晋升 |
-| 正式局部验证 | 缓存 ORB-to-ORB + ORB-SLAM 风格描述子筛选 + PnP |
-| Phase B | 工程准入已通过；原 `VisualMap.pose` 保持不变 |
-| Phase C | 离线比较 no-loop、fixed information、covariance information |
+| 已同步基线 | `1972da7`（testb 最新 DBoW2/通用 Phase C） |
+| 地点识别 | 默认 `dbow2_orb` + `ORBvoc.txt`；`custom_binary` 仅作消融 |
+| 正式局部验证 | ORB-to-ORB + ORB-SLAM 风格筛选 + PnP + 最终候选 Flow LM 精化 |
+| 回环缓存 | 实验配置每 5 个 sensor frame 缓存一次 |
+| 全局优化 | CPU 稀疏 LM；fixed 与 mixed covariance/fixed information 对比 |
+| 当前状态 | 新整合路线已实现，等待服务器 Docker CUDA/离线验证 |
 
 修改前必须执行 `git status --short --branch`。工作区可能包含用户改动，不得恢复、覆盖或一并提交。CUDA 完整实验在远程服务器 Docker 中运行。
 
@@ -30,7 +31,8 @@ FlowFormerCov 双目/相邻帧估计
 回环是可插拔扩展：
 
 - 禁用回环时，不提取额外几何描述子、不写 sidecar、不执行回环验证。
-- 不修改原 `KeypointSelector`、Frontend、TwoFramePGO 和 GlobalPGO 主逻辑。
+- 不修改原 `KeypointSelector`、Frontend 和 TwoFramePGO 主逻辑；GlobalPGO
+  保留原 LBFGS 默认路径，新增可选 `sparse_lm`。
 - 回环缓存或验证失败只能禁用回环，原 VO 必须继续。
 - Phase A/B/C 离线实验不得修改原 `VisualMap.pose`。
 - 新路线优先复用缓存和现有接口，避免增加与结论无关的门限和模块。
@@ -46,8 +48,11 @@ BoW 候选（诊断配置取 top-10）
 → 简化 ORB-SLAM 方向直方图
 → 带只读 VO 初值的 PnP RANSAC
 → 每个 query 从通过者中选择历史最早候选
-→ PnP 内点的 disparity information observe
-→ pose 副本 GlobalPGO
+→ 只对最终候选执行一次 historical→current FlowFormer 推理
+→ PnP 正深度内点位置采样 flow/covariance 与 current disparity
+→ Huber 加权 `[u,v,disp]` 两帧 LM 精化
+→ 最终鲁棒 Hessian 生成回环边 information
+→ pose 副本稀疏 Global LM
 ```
 
 关键契约：
@@ -59,10 +64,13 @@ BoW 候选（诊断配置取 top-10）
 - 当前参数：100 次、10 px、confidence 0.99、正深度内点至少 25。
 - 绝对旋转上限已放宽到 180°，不再阻断正常大角度真实回环；VO 初值差只记录。
 - 不采用 mutual、内点率、空间覆盖、Essential、旧 pair-risk/calibration gate。
+- Flow 仅在 ORB/PnP 最终候选上运行一次；失败则拒绝该边，不回退 PnP 位姿。
+- `match.mask=None` 表示无附加 mask；稠密图仅用 `floor(uv)` 索引，几何保留浮点坐标。
+- 记录 Flow 与 ORB 对同一 current 像素预测差的 p50/p90，只诊断、不设门限。
 
 旧 fixed-point 局部验证与旧 Phase B.5 已完成 CUDA observe，但未晋升；仅保留用于复现和消融，不再作为正式主路线。
 
-## 4. Information 契约
+## 4. 精化与 Information 契约
 
 每个 PnP 内点使用 `[u,v,disp]` 残差：
 
@@ -71,45 +79,74 @@ Sigma_r = Sigma_current
         + J_X R Sigma_candidate_3D R^T J_X^T
 ```
 
-- ORB 像素 covariance 使用 `match_cov_default`；disparity 使用同帧深度方差换算。
+- 回环 current `[u,v]` covariance 使用本次长跨度 FlowFormer 的
+  `uu,vv,uv`；current disparity/variance 也来自本次 `estimate_pair`。
+- candidate 3D/covariance 始终来自 historical 缓存深度及其 covariance，
+  不误用本次返回的 current depth。
 - current depth covariance 不重复计权；Hamming 距离不作为 covariance。
 - `Sigma_r` 对称化后严格 Cholesky，不使用 jitter。
+- 局部 Huber 使用白化残差范数，`delta=2.795`；最终 information 为终点
+  重新线性化的鲁棒 Hessian，不含 LM 阻尼，也不对 Huber 权重求导。
 - 白化 `3×6` Jacobian 堆叠后必须满秩。
 - raw Hessian 在 `T_current_candidate` 上计算，再以 Adjoint 转到最终边方向。
-- covariance information 通过广义特征值缩放，只允许相对 fixed information 降权。
-- information 无效边同时退出 fixed/covariance pose-copy PGO，保证两分支边集完全一致。
+- 回环 raw Hessian 不再做旧广义特征值上限缩放；逐边输出点数、trace、
+  `trace/point_count`、秩、条件数与特征值。
 
-第一轮 information 为 observe-only，不写入在线回环边。
+顺序边：
+
+- 仅当 `match2frame1=src && match2frame2=dst` 时使用对应 MatchObs 构造同一
+  `[u,v,disp]` 鲁棒观测 Hessian。
+- 缺少直接观测、数值非法或退化时显式回退 `100I`，不删除边，保证图连通。
+- 因而该实验分支必须称为 `mixed covariance/fixed information`，并报告
+  observation-Hessian 边数、fallback 数量、比例和原因。
 
 ## 5. 已冻结实验结论
 
 - 固定 flow covariance 门限 `uu/vv<=100` 是旧 Flow PnP 覆盖率的直接阻断项；固定补点会增加大误差约束，路线已淘汰。
-- DBoW2 在当前 OpenCV ORB 与 abf001 审核集上 Recall@10 低于 custom，因此未晋升；不代表 DBoW2 本身无效。
+- DBoW2 在早期 abf001 人工审核集上 Recall@10 低于 custom，但该标签未经最终
+  确认；为提高跨数据集泛化性，当前正式默认已改为标准 ORBvoc/DBoW2。
 - ORB-to-ORB 严格匹配在 `1200→1100` 恢复了 25 个 PnP 内点并形成有效 information。
 - 提交 `7ca8970` 的 Phase B 结果：5 对几何通过、5 对 information 有效、最终选择 4 条回环边。
 - 4 条最终边的 GT 位姿代理均为 `accurate`，`large-error=0`；fixed/covariance pose-copy PGO 均 `safe=true`，Phase B 工程准入通过。
 - 当前 4 条边均约为 100–110 帧跨度，`long_span_accurate=0`。这只是工程 smoke test，不是论文级稳定性证据。
 
-## 6. Phase C 当前任务
+## 6. 当前全局优化与实验任务
 
-离线、只读比较：
+CPU 稀疏 LM：
 
 ```text
-no-loop：原轨迹，不注册 loop edge、不运行 PGO
-fixed：原轨迹 + odometry edges + 4 条 fixed-information loop edges
-covariance：相同轨迹、相同 edges，仅替换为 covariance information
+首帧固定
+→ 对 src/dst 左扰动做中心差分 Jacobian
+→ 稀疏 J、H=JᵀJ
+→ H + λ·diag(max(diag(H), eps))
+→ scipy.sparse.linalg.spsolve
+→ 仅接受鲁棒损失下降的步
 ```
 
-要求：
+- loop edge 使用 Huber `delta=3.548`；odometry observation Hessian 已在局部
+  观测层使用 Huber，不再在位姿残差层重复加核。
+- 非有限解、秩警告、无下降步均拒绝；失败输出原轨迹 fallback，禁止晋升。
+- 原 LBFGS 路径仍是缺少 `solver` 字段时的兼容默认值。
 
-- 三方边集、相对位姿和索引严格一致；fixed/covariance 只允许 information 不同。
+离线比较：
+
+```text
+no-loop：原轨迹，不注册 loop edge
+fixed：odometry 100I + loop 100I
+mixed covariance/fixed：direct odometry observation Hessian
+                        + missing-edge 100I fallback
+                        + refined loop raw Hessian
+```
+
+- fixed/mixed 使用完全相同的精化回环边集，只允许 information 不同。
 - no-loop 的回环边只用于 residual 诊断，不进入优化图。
 - 正式 ATE/RPE 复用 `Evaluation/MetricsSeq.py` 的 evo 全局对齐口径。
-- 同时报最大位姿修正、相邻变形、loop residual，以及各自优化前后 loss。
-- 本轮不采用 Huber，不重新运行 VO，不修改 GlobalPGO，不在线写回 pose。
-- 只有安全检查通过、ATE/RPE 均不恶化且 loop residual 显著下降的分支才标为 `positive`；其余为 `inconclusive` 或 `failed`。
+- 同时报最大位姿修正、相邻变形、loop residual、优化前后鲁棒 loss 和
+  顺序边 information fallback 覆盖率。
+- Phase B/C 离线仍不得修改原 `VisualMap.pose`。
 
-主要入口：`Scripts/AdHoc/RunLoopPhaseCOffline.py`。
+主要入口：`Scripts/AdHoc/RunLoopPhaseBOffline.py` 与
+`Scripts/AdHoc/RunLoopPhaseCOffline.py`。
 
 ## 7. 测试与 GT 口径
 

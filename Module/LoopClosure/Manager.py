@@ -37,6 +37,7 @@ from .VINSGeometry import (
     cached_orb_geometry,
     fixed_loop_information,
     fixed_point_covariance,
+    refine_geometry_with_network,
     verify_fixed_geometry,
 )
 from .Verification import LoopCandidateVerifier, LoopConstraint, has_required_pnp_functions
@@ -255,6 +256,7 @@ class LoopClosureManager(ConfigTestable):
             }, {
                 "feature_source": lambda value: value in {"fixed_covariance", "orb_detected"},
                 "descriptor_match_mode": lambda value: value in {"vins_legacy", "orbslam"},
+                "network_refinement": lambda value: isinstance(value, SimpleNamespace),
             })
             feature_source = getattr(config.vins_geometry, "feature_source", "fixed_covariance")
             descriptor_match_mode = getattr(
@@ -262,6 +264,15 @@ class LoopClosureManager(ConfigTestable):
             )
             if descriptor_match_mode == "orbslam" and feature_source != "orb_detected":
                 raise ValueError("descriptor_match_mode=orbslam requires feature_source=orb_detected")
+            network_refinement = getattr(config.vins_geometry, "network_refinement", None)
+            if isinstance(network_refinement, SimpleNamespace):
+                _validate_section(network_refinement, {
+                    "enabled": lambda value: isinstance(value, bool),
+                    "min_points": lambda value: _is_int(value, lambda item: item >= 6),
+                    "huber_delta": lambda value: _is_number(value, lambda item: item > 0.0),
+                    "max_iterations": lambda value: _is_int(value, lambda item: item > 0),
+                    "damping_initial": lambda value: _is_number(value, lambda item: item > 0.0),
+                })
 
     def set_frontend(self, frontend: IFrontend) -> None:
         self.frontend = frontend
@@ -1001,6 +1012,13 @@ class LoopClosureManager(ConfigTestable):
         pgo_fixed_constraints: list[dict[str, Any]] = []
         pgo_covariance_constraints: list[dict[str, Any]] = []
         config = self.config.vins_geometry
+        network_inference_calls = 0
+        network_refinement = getattr(config, "network_refinement", None)
+        network_refinement_enabled = bool(
+            getattr(network_refinement, "enabled", False)
+        )
+        if network_refinement_enabled and self.frontend is None:
+            raise RuntimeError("network loop refinement requires an injected Frontend")
         feature_source = str(getattr(config, "feature_source", "fixed_covariance"))
         descriptor_match_mode = str(getattr(config, "descriptor_match_mode", "vins_legacy"))
         geometry_cache: dict[int, tuple[GeometryFeatureRecord | None, str | None, dict[str, Any]]] = {}
@@ -1038,7 +1056,9 @@ class LoopClosureManager(ConfigTestable):
                 query.get("candidates", []),
                 key=lambda item: (-float(item.get("score", 0.0)), int(item["sensor_frame_idx"])),
             )[:int(config.max_candidates)]
-            accepted: list[tuple[int, GeometryResult]] = []
+            accepted: list[
+                tuple[int, GeometryResult, LoopFrameRecord, GeometryFeatureRecord]
+            ] = []
             for candidate in candidates:
                 candidate_meta = metadata_by_loop.get(int(candidate["loop_frame_idx"]))
                 pair_id = f"{int(query['loop_frame_idx'])}:{int(candidate['loop_frame_idx'])}"
@@ -1075,6 +1095,16 @@ class LoopClosureManager(ConfigTestable):
                         current_geometry, candidate_geometry, pose_snapshot,
                         self.match_cov_default, fixed_information,
                     )
+                    if network_refinement_enabled and result.constraint is not None:
+                        result.covariance_information = None
+                        result.row.update({
+                            "information_valid": False,
+                            "pgo_comparison_eligible": False,
+                            "information_observe": {
+                                "valid": False,
+                                "reason": "network_refinement_pending_selection",
+                            },
+                        })
                 except Exception as error:
                     rows.append({
                         "pair_id": pair_id, "status": "rejected",
@@ -1096,11 +1126,40 @@ class LoopClosureManager(ConfigTestable):
                 rows.append(result.row)
                 if result.constraint is not None:
                     result.row["selected_for_query"] = False
-                    accepted.append((int(candidate["sensor_frame_idx"]), result))
+                    accepted.append((
+                        int(candidate["sensor_frame_idx"]),
+                        result,
+                        candidate_frame,
+                        candidate_geometry,
+                    ))
             if accepted:
-                _, chosen = min(accepted, key=lambda item: item[0])
+                _, chosen, chosen_frame, chosen_geometry = min(
+                    accepted, key=lambda item: item[0],
+                )
+                if network_refinement_enabled:
+                    assert self.frontend is not None
+                    network_inference_calls += 1
+                    chosen = refine_geometry_with_network(
+                        chosen,
+                        network_refinement,
+                        self.frontend,
+                        current_frame,
+                        chosen_frame,
+                        current_geometry,
+                        chosen_geometry,
+                        fixed_information,
+                    )
+                if chosen.constraint is None:
+                    chosen.row.update({
+                        "selected_for_query": False,
+                        "status": "rejected",
+                        "reject_code": "network_refinement_failed",
+                        "reject_reason": (
+                            chosen.row.get("network_refinement", {}).get("reason")
+                        ),
+                    })
+                    continue
                 chosen.row["selected_for_query"] = True
-                assert chosen.constraint is not None
                 selected_constraints.append(chosen.constraint)
                 if chosen.covariance_information is not None:
                     fixed_payload = chosen.constraint.to_dict()
@@ -1115,7 +1174,11 @@ class LoopClosureManager(ConfigTestable):
             raise RuntimeError("VINS-style loop verification modified VisualMap poses")
         payload = {
             "schema_version": 1,
-            "mode": "vins_geometry_disp_information_observe",
+            "mode": (
+                "vins_geometry_network_refined_information"
+                if network_refinement_enabled
+                else "vins_geometry_disp_information_observe"
+            ),
             "feature_source": feature_source,
             "descriptor_match_mode": descriptor_match_mode,
             "summary": {
@@ -1126,6 +1189,11 @@ class LoopClosureManager(ConfigTestable):
                 "selected_pgo_comparison_edges": sum(
                     row.get("selected_for_query") is True
                     and row.get("pgo_comparison_eligible") is True
+                    for row in rows
+                ),
+                "network_refinement_inference_calls": network_inference_calls,
+                "network_refinement_succeeded_pairs": sum(
+                    row.get("network_refinement", {}).get("status") == "succeeded"
                     for row in rows
                 ),
             },
@@ -1150,7 +1218,11 @@ class LoopClosureManager(ConfigTestable):
             "schema_version": 1,
             "feature_source": feature_source,
             "descriptor_match_mode": descriptor_match_mode,
-            "information_policy": "disp_covariance_information_observe",
+            "information_policy": (
+                "network_reprojection_disparity_raw_robust_hessian"
+                if network_refinement_enabled
+                else "disp_covariance_information_observe"
+            ),
             "constraints": pgo_covariance_constraints,
         }
         self._write_json_bundle([

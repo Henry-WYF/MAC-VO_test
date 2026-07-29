@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -13,7 +13,13 @@ import pypose as pp
 import torch
 
 from Module.Covariance.Project2to3 import Covariance_2to3_full
+from Module.Frontend.Frontend import IFrontend
 from Module.Optimization.GlobalPGO import make_information
+from Module.Optimization.ObservationInformation import (
+    covariance_triplet_to_matrix,
+    information_diagnostics,
+    robust_observation_system,
+)
 from Utility.Point import pixel2point_NED
 
 from .PhaseB5 import reproj_disp_linearization, transform_information_for_inverse
@@ -43,6 +49,9 @@ class GeometryResult:
     row: dict[str, Any]
     constraint: LoopConstraint | None
     covariance_information: torch.Tensor | None
+    pnp_pose_current_candidate: pp.LieTensor | None = None
+    pnp_current_local: torch.Tensor | None = None
+    pnp_candidate_local: torch.Tensor | None = None
 
 
 def cached_orb_geometry(
@@ -604,7 +613,338 @@ def verify_fixed_geometry(
         mean_reproj_error_px=float(errors.mean()), rotation_diff_deg=vo_delta_r,
         translation_diff_m=vo_delta_t, status="accepted",
     )
-    return GeometryResult(row, constraint, info_matrix)
+    return GeometryResult(
+        row,
+        constraint,
+        info_matrix,
+        pnp_pose_current_candidate=pose,
+        pnp_current_local=selected_current.detach().cpu(),
+        pnp_candidate_local=selected_candidate.detach().cpu(),
+    )
+
+
+def refine_geometry_with_network(
+    result: GeometryResult,
+    config: SimpleNamespace,
+    frontend: IFrontend,
+    current_frame: LoopFrameRecord,
+    candidate_frame: LoopFrameRecord,
+    current: GeometryFeatureRecord,
+    historical: GeometryFeatureRecord,
+    fixed_information: torch.Tensor,
+) -> GeometryResult:
+    """Refine one ORB/PnP-approved pair with one historical-to-current network match."""
+    row = result.row
+    refinement: dict[str, Any] = {
+        "enabled": True,
+        "status": "failed",
+        "reason": None,
+        "frontend_inference_calls": 1,
+        "sampling": "floor_map_index_float_geometry",
+        "flow_covariance_channels": ["uu", "vv", "uv"],
+        "cross_covariance_mode": "ignored_independent_approximation",
+        "huber_delta": float(getattr(config, "huber_delta", 2.795)),
+        "min_points": int(getattr(config, "min_points", 6)),
+    }
+    row["network_refinement"] = refinement
+    if (
+        result.constraint is None
+        or result.pnp_pose_current_candidate is None
+        or result.pnp_current_local is None
+        or result.pnp_candidate_local is None
+    ):
+        refinement["reason"] = "missing_pnp_state"
+        row.update({"information_valid": False, "pgo_comparison_eligible": False})
+        return GeometryResult(row, None, None)
+
+    try:
+        depth_current, match = frontend.estimate_pair(
+            candidate_frame.to_stereo_data(getattr(frontend.config, "device", "cpu")),
+            current_frame.to_stereo_data(getattr(frontend.config, "device", "cpu")),
+        )
+    except Exception as error:
+        refinement.update({
+            "reason": "frontend_exception",
+            "detail": f"{type(error).__name__}: {error}",
+        })
+        row.update({"information_valid": False, "pgo_comparison_eligible": False})
+        return GeometryResult(row, None, None)
+
+    flow_map = getattr(match, "flow", None)
+    covariance_map = getattr(match, "cov", None)
+    disparity_map = getattr(depth_current, "disparity", None)
+    disparity_variance_map = getattr(depth_current, "disparity_uncertainty", None)
+    if (
+        flow_map is None or covariance_map is None
+        or disparity_map is None or disparity_variance_map is None
+        or flow_map.ndim != 4 or flow_map.shape[1] != 2
+        or covariance_map.ndim != 4 or covariance_map.shape[1] != 3
+        or disparity_map.ndim != 4 or disparity_map.shape[1] != 1
+        or disparity_variance_map.ndim != 4
+        or disparity_variance_map.shape[1] != 1
+    ):
+        refinement["reason"] = "missing_or_invalid_frontend_uncertainty"
+        row.update({"information_valid": False, "pgo_comparison_eligible": False})
+        return GeometryResult(row, None, None)
+
+    current_local = result.pnp_current_local.long()
+    candidate_local = result.pnp_candidate_local.long()
+    candidate_uv = historical.pixel_uv[candidate_local].detach().cpu().double()
+    orb_current_uv = current.pixel_uv[current_local].detach().cpu().double()
+    floor_candidate = torch.floor(candidate_uv).long()
+    height, width = int(flow_map.shape[-2]), int(flow_map.shape[-1])
+    candidate_inbound = (
+        torch.isfinite(candidate_uv).all(dim=1)
+        & (floor_candidate[:, 0] >= 0) & (floor_candidate[:, 0] < width)
+        & (floor_candidate[:, 1] >= 0) & (floor_candidate[:, 1] < height)
+    )
+    source_indices = torch.nonzero(candidate_inbound, as_tuple=False).squeeze(1)
+    if source_indices.numel() == 0:
+        refinement["reason"] = "no_inbound_pnp_inlier_sources"
+        row.update({"information_valid": False, "pgo_comparison_eligible": False})
+        return GeometryResult(row, None, None)
+
+    floor_source = floor_candidate[source_indices]
+    flow_cpu = flow_map[0].detach().cpu().double()
+    covariance_cpu = covariance_map[0].detach().cpu().double()
+    sampled_flow = flow_cpu[:, floor_source[:, 1], floor_source[:, 0]].T
+    sampled_covariance = covariance_cpu[:, floor_source[:, 1], floor_source[:, 0]].T
+    network_current_uv = candidate_uv[source_indices] + sampled_flow
+    floor_current = torch.floor(network_current_uv).long()
+    current_height, current_width = int(disparity_map.shape[-2]), int(disparity_map.shape[-1])
+    current_inbound = (
+        torch.isfinite(network_current_uv).all(dim=1)
+        & (floor_current[:, 0] >= 0) & (floor_current[:, 0] < current_width)
+        & (floor_current[:, 1] >= 0) & (floor_current[:, 1] < current_height)
+    )
+    mask_valid = torch.ones_like(current_inbound)
+    if getattr(match, "mask", None) is not None:
+        mask_cpu = match.mask[0, 0].detach().cpu().bool()
+        mask_valid = mask_cpu[floor_source[:, 1], floor_source[:, 0]]
+    disparity_cpu = disparity_map[0, 0].detach().cpu().double()
+    disparity_variance_cpu = disparity_variance_map[0, 0].detach().cpu().double()
+    sampled_disparity = torch.full((len(source_indices),), torch.nan, dtype=torch.float64)
+    sampled_disparity_variance = torch.full_like(sampled_disparity, torch.nan)
+    if bool(current_inbound.any()):
+        uv = floor_current[current_inbound]
+        sampled_disparity[current_inbound] = disparity_cpu[uv[:, 1], uv[:, 0]]
+        sampled_disparity_variance[current_inbound] = (
+            disparity_variance_cpu[uv[:, 1], uv[:, 0]]
+        )
+    candidate_points = historical.point_camera[
+        candidate_local[source_indices]
+    ].detach().cpu().double()
+    candidate_covariance = historical.point_covariance_camera[
+        candidate_local[source_indices]
+    ].detach().cpu().double()
+    uv_covariance = covariance_triplet_to_matrix(sampled_covariance)
+    valid = (
+        current_inbound
+        & mask_valid
+        & torch.isfinite(sampled_flow).all(dim=1)
+        & torch.isfinite(uv_covariance).all(dim=(1, 2))
+        & torch.isfinite(sampled_disparity)
+        & torch.isfinite(sampled_disparity_variance)
+        & (sampled_disparity > 0.0)
+        & (sampled_disparity_variance > 0.0)
+        & torch.isfinite(candidate_points).all(dim=1)
+        & torch.isfinite(candidate_covariance).all(dim=(1, 2))
+        & (candidate_points[:, 0] > 0.0)
+    )
+    refinement.update({
+        "pnp_positive_inlier_sources": int(len(candidate_local)),
+        "candidate_inbound": int(candidate_inbound.sum()),
+        "flow_and_disparity_valid": int(valid.sum()),
+        "match_mask_present": getattr(match, "mask", None) is not None,
+    })
+    flow_orb_difference = torch.linalg.vector_norm(
+        network_current_uv - orb_current_uv[source_indices], dim=1,
+    )
+    finite_difference = flow_orb_difference[torch.isfinite(flow_orb_difference)]
+    refinement["flow_vs_orb_current_uv_distance_px"] = {
+        "count": int(finite_difference.numel()),
+        "p50": (
+            float(torch.quantile(finite_difference, 0.5))
+            if finite_difference.numel() else None
+        ),
+        "p90": (
+            float(torch.quantile(finite_difference, 0.9))
+            if finite_difference.numel() else None
+        ),
+    }
+    minimum = int(getattr(config, "min_points", 6))
+    if int(valid.sum()) < minimum:
+        refinement["reason"] = "insufficient_valid_flow_refinement_points"
+        row.update({"information_valid": False, "pgo_comparison_eligible": False})
+        return GeometryResult(row, None, None)
+
+    candidate_points = candidate_points[valid]
+    candidate_covariance = candidate_covariance[valid]
+    network_current_uv = network_current_uv[valid]
+    uv_covariance = uv_covariance[valid]
+    sampled_disparity = sampled_disparity[valid]
+    sampled_disparity_variance = sampled_disparity_variance[valid]
+    intrinsic = (
+        current_frame.intrinsic[0]
+        if current_frame.intrinsic.ndim == 3 else current_frame.intrinsic
+    ).detach().cpu().double()
+    baseline = current_frame.baseline.detach().cpu().double()
+    huber_delta = float(getattr(config, "huber_delta", 2.795))
+
+    def system_at(pose: pp.LieTensor):
+        return robust_observation_system(
+            pose,
+            candidate_points,
+            candidate_covariance,
+            network_current_uv,
+            uv_covariance,
+            sampled_disparity,
+            sampled_disparity_variance,
+            intrinsic,
+            baseline,
+            huber_delta,
+        )
+
+    pose = result.pnp_pose_current_candidate.detach().cpu().double()
+    try:
+        initial_system = system_at(pose)
+    except ValueError as error:
+        refinement["reason"] = str(error)
+        row.update({"information_valid": False, "pgo_comparison_eligible": False})
+        return GeometryResult(row, None, None)
+    positive = initial_system.transformed[:, 0] > 1e-6
+    if int(positive.sum()) < minimum:
+        refinement["reason"] = "insufficient_positive_flow_refinement_points"
+        row.update({"information_valid": False, "pgo_comparison_eligible": False})
+        return GeometryResult(row, None, None)
+    if not bool(positive.all()):
+        candidate_points = candidate_points[positive]
+        candidate_covariance = candidate_covariance[positive]
+        network_current_uv = network_current_uv[positive]
+        uv_covariance = uv_covariance[positive]
+        sampled_disparity = sampled_disparity[positive]
+        sampled_disparity_variance = sampled_disparity_variance[positive]
+        initial_system = system_at(pose)
+
+    initial_cost = initial_system.robust_cost
+    current_cost = initial_cost
+    damping = float(getattr(config, "damping_initial", 1e-3))
+    accepted_steps = 0
+    rejected_trials = 0
+    converged = False
+    max_iterations = int(getattr(config, "max_iterations", 15))
+    for _ in range(max_iterations):
+        try:
+            system = system_at(pose)
+        except ValueError:
+            break
+        diagonal = torch.diagonal(system.hessian).clamp_min(1e-12)
+        accepted = False
+        for _trial in range(5):
+            try:
+                delta = torch.linalg.solve(
+                    system.hessian + damping * torch.diag(diagonal),
+                    -system.gradient,
+                )
+            except torch.linalg.LinAlgError:
+                delta = torch.full((6,), torch.nan, dtype=torch.float64)
+            if not torch.isfinite(delta).all():
+                damping = min(damping * 10.0, 1e9)
+                rejected_trials += 1
+                continue
+            translation_step = float(torch.linalg.vector_norm(delta[:3]))
+            rotation_step = float(torch.linalg.vector_norm(delta[3:]))
+            if translation_step <= 1e-6 and rotation_step <= 1e-6:
+                converged = True
+                accepted = True
+                break
+            trial_pose = pp.se3(delta).Exp() @ pose
+            try:
+                trial_system = system_at(trial_pose)
+            except ValueError:
+                trial_system = None
+            if (
+                trial_system is not None
+                and math.isfinite(trial_system.robust_cost)
+                and trial_system.robust_cost < current_cost
+            ):
+                pose = trial_pose
+                current_cost = trial_system.robust_cost
+                damping = max(damping / 3.0, 1e-9)
+                accepted_steps += 1
+                accepted = True
+                break
+            damping = min(damping * 10.0, 1e9)
+            rejected_trials += 1
+        if converged or not accepted:
+            break
+
+    try:
+        final_system = system_at(pose)
+    except ValueError as error:
+        refinement["reason"] = str(error)
+        row.update({"information_valid": False, "pgo_comparison_eligible": False})
+        return GeometryResult(row, None, None)
+    final_positive = final_system.transformed[:, 0] > 1e-6
+    if int(final_positive.sum()) < minimum or not bool(final_positive.all()):
+        refinement["reason"] = "nonpositive_points_after_refinement"
+        row.update({"information_valid": False, "pgo_comparison_eligible": False})
+        return GeometryResult(row, None, None)
+    tolerance = max(1e-9, 1e-9 * abs(initial_cost))
+    if (
+        not math.isfinite(final_system.robust_cost)
+        or final_system.robust_cost > initial_cost + tolerance
+        or not torch.isfinite(pose.tensor()).all()
+    ):
+        refinement["reason"] = "nonfinite_or_increased_refinement_cost"
+        row.update({"information_valid": False, "pgo_comparison_eligible": False})
+        return GeometryResult(row, None, None)
+    information, information_payload = information_diagnostics(
+        final_system,
+        pose,
+        point_count=len(candidate_points),
+    )
+    if information is None:
+        refinement["reason"] = information_payload.get("reason")
+        refinement["information"] = information_payload
+        row.update({"information_valid": False, "pgo_comparison_eligible": False})
+        return GeometryResult(row, None, None)
+
+    edge = pose.Inv()
+    refinement.update({
+        "status": "succeeded",
+        "reason": None,
+        "initial_robust_cost": initial_cost,
+        "final_robust_cost": final_system.robust_cost,
+        "accepted_steps": accepted_steps,
+        "rejected_trials": rejected_trials,
+        "converged": converged,
+        "final_point_count": len(candidate_points),
+    })
+    row.update({
+        "status": "accepted",
+        "reject_code": None,
+        "geometry_accepted": True,
+        "information_valid": True,
+        "pgo_comparison_eligible": True,
+        "information_observe": information_payload,
+        "refined_relative_pose": edge.tensor().detach().cpu().tolist(),
+        "relative_pose": edge.tensor().detach().cpu().tolist(),
+    })
+    constraint = replace(
+        result.constraint,
+        relative_pose=row["relative_pose"],
+        information=fixed_information.detach().cpu().tolist(),
+        num_flow_points=len(candidate_points),
+    )
+    return GeometryResult(
+        row,
+        constraint,
+        information,
+        pnp_pose_current_candidate=result.pnp_pose_current_candidate,
+        pnp_current_local=result.pnp_current_local,
+        pnp_candidate_local=result.pnp_candidate_local,
+    )
 
 
 def fixed_loop_information(config: SimpleNamespace) -> torch.Tensor:
@@ -631,6 +971,11 @@ def run_pose_copy_pgo_safety(
         result["reason"] = "nonfinite_initial_loss"
         return None, result
     optimized = optimizer.optimize_poses(initial).detach().cpu()
+    solver_diagnostics = getattr(optimizer, "last_optimization_diagnostics", None)
+    result["solver_diagnostics"] = solver_diagnostics
+    if isinstance(solver_diagnostics, dict) and solver_diagnostics.get("safe") is False:
+        result["reason"] = "optimizer_reported_unsafe"
+        return None, result
     final_loss = optimizer.compute_loss(optimized).detach().cpu()
     result["final_loss"] = float(final_loss) if torch.isfinite(final_loss) else None
     if not torch.isfinite(optimized).all() or not torch.isfinite(final_loss):

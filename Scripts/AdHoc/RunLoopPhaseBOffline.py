@@ -246,8 +246,10 @@ def run_vins_pose_copy_pgo(
 
     fixed_optimizer = GlobalPoseGraphOptimizer(global_pgo_config)
     covariance_optimizer = GlobalPoseGraphOptimizer(global_pgo_config)
-    fixed_optimizer.register_odometry_edges(global_map)
-    covariance_optimizer.register_odometry_edges(global_map)
+    fixed_optimizer.register_odometry_edges(global_map, "fixed")
+    covariance_optimizer.register_odometry_edges(
+        global_map, "mixed_covariance_fixed",
+    )
     for fixed, covariance in zip(fixed_rows, covariance_rows):
         identity_keys = (
             "src_visual_map_idx", "dst_visual_map_idx", "src_sensor_frame_idx",
@@ -269,6 +271,16 @@ def run_vins_pose_copy_pgo(
     )
     result["executed"] = True
     result["eligible_loop_edge_count"] = len(fixed_rows)
+    diagnostics = covariance_optimizer.odometry_information_diagnostics
+    fallback = [row for row in diagnostics if row.get("fallback") is True]
+    result["odometry_information"] = {
+        "branch_name": "mixed_covariance_fixed_information",
+        "total_edges": len(diagnostics),
+        "observation_hessian_edges": len(diagnostics) - len(fallback),
+        "fallback_edges": len(fallback),
+        "fallback_ratio": len(fallback) / max(len(diagnostics), 1),
+        "fallback_details": fallback,
+    }
     result["original_pose_invariant"] = torch.equal(
         global_map.frames.data["pose"].tensor, initial
     )
@@ -595,7 +607,19 @@ def main() -> None:
             runtime_frontend_type = "FlowFormerCovFrontend"
         setattr(torch.cuda.nvtx, "range", lambda *args, **kwargs: contextlib.nullcontext())
         nvtx_disabled_for_cpu = True
-    frontend = None if vins_mode else IFrontend.instantiate(runtime_frontend_type, frontend_config.args)
+    network_refinement_enabled = bool(
+        vins_mode
+        and getattr(
+            getattr(loop_config.vins_geometry, "network_refinement", None),
+            "enabled",
+            False,
+        )
+    )
+    frontend = (
+        None
+        if vins_mode and not network_refinement_enabled
+        else IFrontend.instantiate(runtime_frontend_type, frontend_config.args)
+    )
     manager = LoopClosureManager(loop_config)
     manager.set_output_dir(output_dir)
     if not manager.enabled or manager.output_dir is None:
@@ -714,6 +738,7 @@ def main() -> None:
             getattr(loop_config.vins_geometry, "descriptor_match_mode", "vins_legacy")
             if hasattr(loop_config, "vins_geometry") else None
         ),
+        "vins_geometry_network_refinement_enabled": network_refinement_enabled,
         "vins_geometry_descriptor_match_parameters": (
             {
                 "distance_threshold_inclusive": ORB_SLAM_HAMMING_THRESHOLD,
