@@ -1148,6 +1148,8 @@ class LoopClosureManager(ConfigTestable):
                         current_geometry,
                         chosen_geometry,
                         fixed_information,
+                        float(config.max_translation_m),
+                        float(config.max_rotation_deg),
                     )
                 if chosen.constraint is None:
                     chosen.row.update({

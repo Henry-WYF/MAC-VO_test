@@ -632,6 +632,8 @@ def refine_geometry_with_network(
     current: GeometryFeatureRecord,
     historical: GeometryFeatureRecord,
     fixed_information: torch.Tensor,
+    max_translation_m: float,
+    max_rotation_deg: float,
 ) -> GeometryResult:
     """Refine one ORB/PnP-approved pair with one historical-to-current network match."""
     row = result.row
@@ -805,7 +807,51 @@ def refine_geometry_with_network(
             huber_delta,
         )
 
-    pose = result.pnp_pose_current_candidate.detach().cpu().double()
+    initial_pose = result.pnp_pose_current_candidate.detach().cpu().double()
+    pose = initial_pose
+    try:
+        _, _, initial_covariance, _ = reproj_disp_linearization(
+            pose,
+            candidate_points,
+            candidate_covariance,
+            network_current_uv,
+            uv_covariance,
+            sampled_disparity,
+            sampled_disparity_variance,
+            intrinsic,
+            baseline,
+        )
+    except (RuntimeError, ValueError) as error:
+        refinement["reason"] = f"initial_covariance_linearization_failed:{error}"
+        row.update({"information_valid": False, "pgo_comparison_eligible": False})
+        return GeometryResult(row, None, None)
+    initial_covariance = 0.5 * (
+        initial_covariance + initial_covariance.transpose(-1, -2)
+    )
+    covariance_finite = torch.isfinite(initial_covariance).all(dim=(1, 2))
+    covariance_spd = torch.zeros_like(covariance_finite)
+    if bool(covariance_finite.any()):
+        _, cholesky_info = torch.linalg.cholesky_ex(
+            initial_covariance[covariance_finite],
+        )
+        covariance_spd[covariance_finite] = cholesky_info == 0
+    refinement.update({
+        "covariance_checked_points": int(len(covariance_spd)),
+        "covariance_spd_points": int(covariance_spd.sum()),
+        "covariance_dropped_points": int((~covariance_spd).sum()),
+    })
+    if int(covariance_spd.sum()) < minimum:
+        refinement["reason"] = "insufficient_spd_flow_refinement_points"
+        row.update({"information_valid": False, "pgo_comparison_eligible": False})
+        return GeometryResult(row, None, None)
+    if not bool(covariance_spd.all()):
+        candidate_points = candidate_points[covariance_spd]
+        candidate_covariance = candidate_covariance[covariance_spd]
+        network_current_uv = network_current_uv[covariance_spd]
+        uv_covariance = uv_covariance[covariance_spd]
+        sampled_disparity = sampled_disparity[covariance_spd]
+        sampled_disparity_variance = sampled_disparity_variance[covariance_spd]
+
     try:
         initial_system = system_at(pose)
     except ValueError as error:
@@ -885,20 +931,60 @@ def refine_geometry_with_network(
         refinement["reason"] = str(error)
         row.update({"information_valid": False, "pgo_comparison_eligible": False})
         return GeometryResult(row, None, None)
-    final_positive = final_system.transformed[:, 0] > 1e-6
-    if int(final_positive.sum()) < minimum or not bool(final_positive.all()):
-        refinement["reason"] = "nonpositive_points_after_refinement"
+    final_positive = (
+        torch.isfinite(final_system.transformed).all(dim=1)
+        & (final_system.transformed[:, 0] > 1e-6)
+    )
+    refinement["final_nonpositive_dropped_points"] = int((~final_positive).sum())
+    if int(final_positive.sum()) < minimum:
+        refinement["reason"] = "insufficient_positive_points_after_refinement"
         row.update({"information_valid": False, "pgo_comparison_eligible": False})
         return GeometryResult(row, None, None)
-    tolerance = max(1e-9, 1e-9 * abs(initial_cost))
+    comparison_initial_cost = initial_cost
+    if not bool(final_positive.all()):
+        candidate_points = candidate_points[final_positive]
+        candidate_covariance = candidate_covariance[final_positive]
+        network_current_uv = network_current_uv[final_positive]
+        uv_covariance = uv_covariance[final_positive]
+        sampled_disparity = sampled_disparity[final_positive]
+        sampled_disparity_variance = sampled_disparity_variance[final_positive]
+        try:
+            comparison_initial_cost = system_at(initial_pose).robust_cost
+            final_system = system_at(pose)
+        except ValueError as error:
+            refinement["reason"] = str(error)
+            row.update({"information_valid": False, "pgo_comparison_eligible": False})
+            return GeometryResult(row, None, None)
+    tolerance = max(1e-9, 1e-9 * abs(comparison_initial_cost))
     if (
         not math.isfinite(final_system.robust_cost)
-        or final_system.robust_cost > initial_cost + tolerance
+        or final_system.robust_cost > comparison_initial_cost + tolerance
         or not torch.isfinite(pose.tensor()).all()
     ):
         refinement["reason"] = "nonfinite_or_increased_refinement_cost"
         row.update({"information_valid": False, "pgo_comparison_eligible": False})
         return GeometryResult(row, None, None)
+
+    refined_translation_m, refined_rotation_deg = _pose_magnitude(pose)
+    pnp_to_refined_translation_m, pnp_to_refined_rotation_deg = _pose_difference(
+        pose, initial_pose,
+    )
+    refinement.update({
+        "refined_translation_m": refined_translation_m,
+        "refined_rotation_deg": refined_rotation_deg,
+        "pnp_to_refined_translation_m": pnp_to_refined_translation_m,
+        "pnp_to_refined_rotation_deg": pnp_to_refined_rotation_deg,
+        "max_translation_m": float(max_translation_m),
+        "max_rotation_deg": float(max_rotation_deg),
+    })
+    if (
+        refined_translation_m >= float(max_translation_m)
+        or refined_rotation_deg >= float(max_rotation_deg)
+    ):
+        refinement["reason"] = "refined_pose_safety_gate"
+        row.update({"information_valid": False, "pgo_comparison_eligible": False})
+        return GeometryResult(row, None, None)
+
     information, information_payload = information_diagnostics(
         final_system,
         pose,
@@ -914,7 +1000,8 @@ def refine_geometry_with_network(
     refinement.update({
         "status": "succeeded",
         "reason": None,
-        "initial_robust_cost": initial_cost,
+        "initial_robust_cost": comparison_initial_cost,
+        "optimization_initial_robust_cost": initial_cost,
         "final_robust_cost": final_system.robust_cost,
         "accepted_steps": accepted_steps,
         "rejected_trials": rejected_trials,
@@ -973,7 +1060,11 @@ def run_pose_copy_pgo_safety(
     optimized = optimizer.optimize_poses(initial).detach().cpu()
     solver_diagnostics = getattr(optimizer, "last_optimization_diagnostics", None)
     result["solver_diagnostics"] = solver_diagnostics
-    if isinstance(solver_diagnostics, dict) and solver_diagnostics.get("safe") is False:
+    if (
+        getattr(optimizer, "solver", None) == "sparse_lm"
+        and isinstance(solver_diagnostics, dict)
+        and solver_diagnostics.get("safe") is False
+    ):
         result["reason"] = "optimizer_reported_unsafe"
         return None, result
     final_loss = optimizer.compute_loss(optimized).detach().cpu()

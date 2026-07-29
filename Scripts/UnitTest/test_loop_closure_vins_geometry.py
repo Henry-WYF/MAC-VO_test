@@ -14,6 +14,7 @@ from Module.LoopClosure.Recognizer import ORBFeatureExtractor
 from Module.LoopClosure.Record import GeometryFeatureRecord
 from Module.LoopClosure.Record import LoopFrameRecord
 from Module.LoopClosure.VINSGeometry import (
+    GeometryResult,
     _cv_pose_to_ned,
     _ned_pose_to_cv,
     _strict_information,
@@ -21,10 +22,12 @@ from Module.LoopClosure.VINSGeometry import (
     fixed_point_covariance,
     match_fixed_descriptors,
     match_orbslam_descriptors,
+    refine_geometry_with_network,
     run_pose_copy_pgo_comparison,
     run_pose_copy_pgo_safety,
     verify_fixed_geometry,
 )
+from Module.LoopClosure.Verification import LoopConstraint
 from Scripts.AdHoc.RunLoopPhaseBOffline import (
     run_vins_pose_copy_pgo,
     summarize_engineering_admission,
@@ -78,6 +81,115 @@ def pnp_geometry(count: int, sensor: int, visual: int, loop: int, translated_x: 
         disparity=20.0 / current_x, disparity_variance=torch.full((count,), 0.1),
         disparity_valid=torch.ones(count, dtype=torch.bool), descriptor=descriptors,
     )
+
+
+def refinement_geometry(sensor: int, visual: int, loop: int) -> GeometryFeatureRecord:
+    pixel = torch.tensor([
+        [30., 25.], [40., 25.], [50., 25.], [60., 25.],
+        [35., 35.], [45., 35.], [55., 35.], [65., 35.],
+    ])
+    depth = torch.linspace(2.0, 4.8, len(pixel))
+    point = torch.stack([
+        depth,
+        (pixel[:, 0] - 50.0) * depth / 100.0,
+        (pixel[:, 1] - 40.0) * depth / 100.0,
+    ], dim=-1)
+    return GeometryFeatureRecord(
+        sensor_frame_idx=sensor,
+        visual_map_idx=visual,
+        loop_frame_idx=loop,
+        orb_config_sha256="abc",
+        original_index=torch.arange(len(pixel)),
+        pixel_uv=pixel,
+        point_camera=point,
+        point_covariance_camera=(
+            torch.eye(3).repeat(len(pixel), 1, 1) * 1e-3
+        ),
+        disparity=20.0 / depth,
+        disparity_variance=torch.full((len(pixel),), 0.1),
+        disparity_valid=torch.ones(len(pixel), dtype=torch.bool),
+        descriptor=torch.zeros((len(pixel), 32), dtype=torch.uint8),
+    )
+
+
+class SyntheticRefinementFrontend:
+    def __init__(
+        self,
+        geometry: GeometryFeatureRecord,
+        *,
+        invalid_covariance_index: int | None = None,
+    ) -> None:
+        self.config = SimpleNamespace(device="cpu")
+        self.calls = 0
+        self.flow = torch.zeros((1, 2, 80, 100))
+        self.covariance = torch.zeros((1, 3, 80, 100))
+        self.covariance[:, :2] = 0.25
+        self.disparity = torch.ones((1, 1, 80, 100))
+        self.disparity_variance = torch.full((1, 1, 80, 100), 0.1)
+        for index, (uv, disparity) in enumerate(
+            zip(geometry.pixel_uv, geometry.disparity)
+        ):
+            u, v = torch.floor(uv).long()
+            self.disparity[0, 0, v, u] = disparity
+            if invalid_covariance_index == index:
+                self.covariance[0, 0, v, u] = -1e6
+
+    def estimate_pair(self, _historical, _current):
+        self.calls += 1
+        depth = SimpleNamespace(
+            disparity=self.disparity,
+            disparity_uncertainty=self.disparity_variance,
+        )
+        match = SimpleNamespace(
+            flow=self.flow,
+            cov=self.covariance,
+            mask=None,
+        )
+        return depth, match
+
+
+def refinement_input() -> tuple[
+    GeometryResult,
+    LoopFrameRecord,
+    LoopFrameRecord,
+    GeometryFeatureRecord,
+    GeometryFeatureRecord,
+]:
+    K = torch.tensor(
+        [[[100., 0., 50.], [0., 100., 40.], [0., 0., 1.]]],
+    )
+    current = refinement_geometry(20, 2, 2)
+    historical = refinement_geometry(10, 1, 1)
+    current_frame = loop_frame(20, 2, 2, K)
+    historical_frame = loop_frame(10, 1, 1, K)
+    identity = pp.identity_SE3(1).double()
+    constraint = LoopConstraint(
+        src_visual_map_idx=1,
+        dst_visual_map_idx=2,
+        src_sensor_frame_idx=10,
+        dst_sensor_frame_idx=20,
+        pnp_relative_pose=identity.tensor().tolist(),
+        relative_pose=identity.tensor().tolist(),
+        information=(torch.eye(6) * 100.0).tolist(),
+        bow_score=1.0,
+        num_flow_points=0,
+        num_geometry_points=len(current.pixel_uv),
+        num_pnp_inliers=len(current.pixel_uv),
+        inlier_ratio=1.0,
+        mean_reproj_error_px=0.0,
+        rotation_diff_deg=0.0,
+        translation_diff_m=0.0,
+        status="accepted",
+    )
+    result = GeometryResult(
+        row={"geometry_accepted": True},
+        constraint=constraint,
+        covariance_information=None,
+        pnp_pose_current_candidate=identity,
+        pnp_current_local=torch.arange(len(current.pixel_uv)),
+        pnp_candidate_local=torch.arange(len(current.pixel_uv)),
+    )
+    return result, current_frame, historical_frame, current, historical
 
 
 def test_geometry_sidecar_first_write_is_atomic_and_not_overwritten(tmp_path: Path) -> None:
@@ -473,6 +585,62 @@ def test_robust_observation_information_uses_covariance_sum_and_is_full_rank() -
     assert diagnostics["normalization"] == "raw_robust_hessian_no_lm_damping"
 
 
+def test_network_refinement_succeeds_with_one_frontend_inference() -> None:
+    result, current_frame, historical_frame, current, historical = refinement_input()
+    frontend = SyntheticRefinementFrontend(historical)
+    refined = refine_geometry_with_network(
+        result,
+        SimpleNamespace(
+            min_points=6,
+            huber_delta=2.795,
+            max_iterations=3,
+            damping_initial=1e-3,
+        ),
+        frontend,
+        current_frame,
+        historical_frame,
+        current,
+        historical,
+        torch.eye(6, dtype=torch.float64) * 100.0,
+        20.0,
+        180.0,
+    )
+    assert frontend.calls == 1
+    assert refined.constraint is not None
+    assert refined.covariance_information is not None
+    assert refined.row["network_refinement"]["status"] == "succeeded"
+    assert refined.row["network_refinement"]["covariance_dropped_points"] == 0
+
+
+def test_network_refinement_drops_one_non_spd_covariance_point() -> None:
+    result, current_frame, historical_frame, current, historical = refinement_input()
+    frontend = SyntheticRefinementFrontend(
+        historical, invalid_covariance_index=0,
+    )
+    refined = refine_geometry_with_network(
+        result,
+        SimpleNamespace(
+            min_points=6,
+            huber_delta=2.795,
+            max_iterations=3,
+            damping_initial=1e-3,
+        ),
+        frontend,
+        current_frame,
+        historical_frame,
+        current,
+        historical,
+        torch.eye(6, dtype=torch.float64) * 100.0,
+        20.0,
+        180.0,
+    )
+    assert frontend.calls == 1
+    assert refined.constraint is not None
+    assert refined.covariance_information is not None
+    assert refined.row["network_refinement"]["covariance_dropped_points"] == 1
+    assert refined.row["network_refinement"]["final_point_count"] == 7
+
+
 def test_pose_copy_safety_rejects_loss_increase() -> None:
     class FakeOptimizer:
         def compute_loss(self, poses: torch.Tensor) -> torch.Tensor:
@@ -490,6 +658,33 @@ def test_pose_copy_safety_rejects_loss_increase() -> None:
     optimized, diagnostics = run_pose_copy_pgo_safety(FakeOptimizer(), poses)
     assert optimized is None
     assert diagnostics["reason"] == "loss_increased"
+
+
+def test_pose_copy_safety_does_not_apply_sparse_status_to_lbfgs() -> None:
+    class FakeLBFGSOptimizer:
+        solver = "lbfgs"
+        last_optimization_diagnostics = {
+            "solver": "lbfgs",
+            "safe": False,
+            "trajectory_source": "not_run",
+        }
+        edges: list = []
+
+        def compute_loss(self, _poses: torch.Tensor) -> torch.Tensor:
+            return torch.tensor(0.0)
+
+        def optimize_poses(self, poses: torch.Tensor) -> torch.Tensor:
+            return poses.clone()
+
+        def compute_residuals(self, _poses: torch.Tensor) -> torch.Tensor:
+            return torch.empty((0, 6))
+
+    poses = pp.identity_SE3(2).tensor()
+    optimized, diagnostics = run_pose_copy_pgo_safety(
+        FakeLBFGSOptimizer(), poses,
+    )
+    assert optimized is not None
+    assert diagnostics["safe"] is True
 
 
 def test_pose_copy_comparison_requires_identical_edge_sets() -> None:

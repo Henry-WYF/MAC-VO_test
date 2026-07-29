@@ -87,6 +87,10 @@ Sigma_r = Sigma_current
 - `Sigma_r` 对称化后严格 Cholesky，不使用 jitter。
 - 局部 Huber 使用白化残差范数，`delta=2.795`；最终 information 为终点
   重新线性化的鲁棒 Hessian，不含 LM 阻尼，也不对 Huber 权重求导。
+- 非有限/非 SPD residual covariance 与精化后非正深度观测按点剔除；
+  剩余点不足或整体 Jacobian 不满秩时才拒绝整条边。
+- 精化后重新执行与 PnP 相同的平移/完整旋转安全门，并记录
+  PnP→精化位姿变化。
 - 白化 `3×6` Jacobian 堆叠后必须满秩。
 - raw Hessian 在 `T_current_candidate` 上计算，再以 Adjoint 转到最终边方向。
 - 回环 raw Hessian 不再做旧广义特征值上限缩放；逐边输出点数、trace、
