@@ -113,6 +113,14 @@ Sigma_r = Sigma_current
 - 提交 `7ca8970` 的 Phase B 结果：5 对几何通过、5 对 information 有效、最终选择 4 条回环边。
 - 4 条最终边的 GT 位姿代理均为 `accurate`，`large-error=0`；fixed/covariance pose-copy PGO 均 `safe=true`，Phase B 工程准入通过。
 - 当前 4 条边均约为 100–110 帧跨度，`long_span_accurate=0`。这只是工程 smoke test，不是论文级稳定性证据。
+- K09 stride-5/DBoW2（提交 `2d66a27`）完成 1591 帧，319 个缓存帧；
+  5 次最终候选网络精化全部成功并形成 5 条可比较回环边。
+- 该轮 Phase C：no-loop ATE RMSE `9.91183`，fixed `2.46161`，
+  mixed `2.31736`；两种 PGO 均安全，但 RPE 轻微上升，均归为
+  `inconclusive`。
+- 该轮顺序边 observation-Hessian 因离线 map loader 未恢复 MatchObs/Point/edge
+  而 100% 回退 `100I`；因此 mixed 结果尚不能解释为顺序边 covariance
+  生效。加载器已修复，需复用同一完整 VO 结果重跑 Phase B/C。
 
 ## 6. 当前全局优化与实验任务
 

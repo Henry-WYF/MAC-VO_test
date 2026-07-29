@@ -20,6 +20,7 @@ from Evaluation.MetricsSeq import evaluateATE, evaluateRPE
 from Module.LoopClosure.VINSGeometry import run_pose_copy_pgo_safety
 from Module.Map import VisualMap
 from Module.Optimization.GlobalPGO import GlobalPoseGraphOptimizer
+from Scripts.AdHoc.RunLoopPhaseBOffline import _load_visual_map
 from Utility.Config import load_config
 from Utility.Sandbox import Sandbox
 from Utility.Trajectory import Trajectory
@@ -161,32 +162,12 @@ def load_phase_c_edges(phase_b_dir: Path) -> tuple[list[dict[str, Any]], list[di
 
 
 def load_phase_c_map(map_path: Path) -> tuple[VisualMap, torch.Tensor, torch.Tensor]:
-    with np.load(map_path, allow_pickle=False) as archive:
-        def array(*names: str) -> np.ndarray:
-            key = next((name for name in names if name in archive.files), None)
-            if key is None:
-                raise ValueError(f"tensor map is missing one of {names}")
-            return archive[key].copy()
-
-        poses = torch.from_numpy(array("frames//pose", "frames/pose")).float()
-        time_ns = torch.from_numpy(array("frames//time_ns", "frames/time_ns")).reshape(-1).long()
-        body_to_sensor = torch.from_numpy(array("frames//T_BS", "frames/T_BS")).float()
-        interp_key = next(
-            (key for key in ("frames//need_interp", "frames/need_interp") if key in archive.files),
-            None,
-        )
-        need_interp = (
-            torch.from_numpy(archive[interp_key].copy()).bool()
-            if interp_key is not None else torch.zeros(len(poses), dtype=torch.bool)
-        )
+    global_map = _load_visual_map(map_path)
+    poses = global_map.frames.data["pose"].tensor
+    time_ns = global_map.frames.data["time_ns"].tensor.reshape(-1).long()
+    body_to_sensor = global_map.frames.data["T_BS"].tensor.float()
     if not (len(poses) == len(time_ns) == len(body_to_sensor)):
         raise ValueError("tensor map pose/time/T_BS lengths differ")
-    global_map = VisualMap()
-    global_map.frames.index.push(torch.arange(len(poses), dtype=torch.long))
-    global_map.frames.data["pose"].push(poses)
-    global_map.frames.data["time_ns"].push(time_ns)
-    global_map.frames.data["T_BS"].push(body_to_sensor)
-    global_map.frames.data["need_interp"].push(need_interp)
     return global_map, time_ns, body_to_sensor
 
 

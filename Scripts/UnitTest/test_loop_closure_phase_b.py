@@ -21,6 +21,7 @@ from Module.LoopClosure.Verification import (
 from Module.Map import VisualMap
 from Module.Map.Template import FrameNode
 from Scripts.AdHoc.RunLoopPhaseBOffline import (
+    _load_visual_map,
     evaluate_gt_pose_proxy,
     limit_queries,
     validate_comparison_outputs,
@@ -28,6 +29,55 @@ from Scripts.AdHoc.RunLoopPhaseBOffline import (
 
 
 _MISSING = object()
+
+
+def test_offline_visual_map_loader_restores_observation_graph(tmp_path: Path) -> None:
+    path = tmp_path / "tensor_map.npz"
+    poses = np.zeros((2, 7), dtype=np.float32)
+    poses[:, 6] = 1.0
+    payload: dict[str, np.ndarray] = {
+        "frames//K": np.repeat(np.eye(3, dtype=np.float32)[None], 2, axis=0),
+        "frames//baseline": np.full(2, 0.2, dtype=np.float32),
+        "frames//pose": poses,
+        "frames//T_BS": poses.copy(),
+        "frames//need_interp": np.zeros(2, dtype=np.bool_),
+        "frames//time_ns": np.arange(2, dtype=np.int64),
+        "points//pos_Tw": np.asarray([[2.0, 0.0, 0.0]], dtype=np.float32),
+        "points//cov_Tw": np.eye(3, dtype=np.float64)[None],
+        "points//color": np.zeros((1, 3), dtype=np.uint8),
+        "edge/frame2match/ranges": np.asarray(
+            [[[0, 1], [-1, -1]], [[0, 1], [-1, -1]]],
+            dtype=np.int64,
+        ),
+        "edge/frame2match/deg": np.ones(2, dtype=np.int64),
+        "edge/point2match/edges": np.asarray(
+            [[0, -1, -1, -1, -1]], dtype=np.int64,
+        ),
+        "edge/point2match/deg": np.ones(1, dtype=np.int64),
+        "edge/match2point/mapping": np.zeros(1, dtype=np.int64),
+        "edge/match2frame1/mapping": np.zeros(1, dtype=np.int64),
+        "edge/match2frame2/mapping": np.ones(1, dtype=np.int64),
+    }
+    match_shapes = {
+        "pixel1_uv": (1, 2), "pixel2_uv": (1, 2),
+        "pixel1_d": (1, 1), "pixel2_d": (1, 1),
+        "pixel1_disp": (1, 1), "pixel2_disp": (1, 1),
+        "pixel1_disp_cov": (1, 1), "pixel2_disp_cov": (1, 1),
+        "obs1_covTc": (1, 3, 3), "obs2_covTc": (1, 3, 3),
+        "pixel1_uv_cov": (1, 3), "pixel2_uv_cov": (1, 3),
+        "pixel1_d_cov": (1, 1), "pixel2_d_cov": (1, 1),
+    }
+    for name, shape in match_shapes.items():
+        payload[f"match//{name}"] = np.ones(shape, dtype=np.float64)
+    np.savez(path, **payload)
+
+    loaded = _load_visual_map(path)
+    frame = loaded.frames[torch.tensor([1], dtype=torch.long)]
+    observations = loaded.get_frame2match(frame)
+    assert len(observations) == 1
+    assert loaded.match2frame1.project(observations.index).item() == 0
+    assert loaded.match2frame2.project(observations.index).item() == 1
+    assert loaded.get_match2point(observations).index.item() == 0
 
 
 def make_config(

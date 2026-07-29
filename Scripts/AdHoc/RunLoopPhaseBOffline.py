@@ -426,32 +426,63 @@ def validate_comparison_outputs(output_dir: Path) -> dict[str, Any]:
 
 def _load_visual_map(path: Path) -> VisualMap:
     with np.load(path, allow_pickle=False) as archive:
-        pose_key = next(
-            (key for key in ("frames//pose", "frames/pose") if key in archive.files),
-            None,
-        )
-        if pose_key is None:
-            raise ValueError(f"tensor map has no serialized frame poses: {path}")
-        poses = torch.from_numpy(archive[pose_key].copy()).to(dtype=torch.float32)
-        interp_key = next(
-            (key for key in ("frames//need_interp", "frames/need_interp") if key in archive.files),
-            None,
-        )
-        need_interp = (
-            torch.from_numpy(archive[interp_key].copy()).bool()
-            if interp_key is not None else torch.zeros(len(poses), dtype=torch.bool)
-        )
-        time_key = next(
-            (key for key in ("frames//time_ns", "frames/time_ns") if key in archive.files),
-            None,
-        )
-        time_ns = torch.from_numpy(archive[time_key].copy()).long() if time_key is not None else None
+        def tensor(prefix: str, name: str) -> torch.Tensor:
+            key = next(
+                (
+                    key for key in (f"{prefix}//{name}", f"{prefix}/{name}")
+                    if key in archive.files
+                ),
+                None,
+            )
+            if key is None:
+                raise ValueError(f"tensor map is missing {prefix}/{name}: {path}")
+            return torch.from_numpy(archive[key].copy())
+
+        frame_data = {
+            name: tensor("frames", name)
+            for name in ("K", "baseline", "pose", "T_BS", "need_interp", "time_ns")
+        }
+        point_data = {
+            name: tensor("points", name)
+            for name in ("pos_Tw", "cov_Tw", "color")
+        }
+        match_data = {
+            name: tensor("match", name)
+            for name in (
+                "pixel1_uv", "pixel2_uv", "pixel1_d", "pixel2_d",
+                "pixel1_disp", "pixel2_disp",
+                "pixel1_disp_cov", "pixel2_disp_cov",
+                "obs1_covTc", "obs2_covTc",
+                "pixel1_uv_cov", "pixel2_uv_cov",
+                "pixel1_d_cov", "pixel2_d_cov",
+            )
+        }
+        edge_data = {
+            "frame2match_ranges": tensor("edge/frame2match", "ranges"),
+            "frame2match_deg": tensor("edge/frame2match", "deg"),
+            "point2match_edges": tensor("edge/point2match", "edges"),
+            "point2match_deg": tensor("edge/point2match", "deg"),
+            "match2point": tensor("edge/match2point", "mapping"),
+            "match2frame1": tensor("edge/match2frame1", "mapping"),
+            "match2frame2": tensor("edge/match2frame2", "mapping"),
+        }
     global_map = VisualMap()
-    global_map.frames.index.push(torch.arange(len(poses), dtype=torch.long))
-    global_map.frames.data["pose"].push(poses)
-    global_map.frames.data["need_interp"].push(need_interp)
-    if time_ns is not None:
-        global_map.frames.data["time_ns"].push(time_ns)
+    global_map.frames.index.push(torch.arange(len(frame_data["pose"]), dtype=torch.long))
+    for name, value in frame_data.items():
+        global_map.frames.data[name].push(value)
+    global_map.points.index.push(torch.arange(len(point_data["pos_Tw"]), dtype=torch.long))
+    for name, value in point_data.items():
+        global_map.points.data[name].push(value)
+    global_map.match.index.push(torch.arange(len(match_data["pixel1_uv"]), dtype=torch.long))
+    for name, value in match_data.items():
+        global_map.match.data[name].push(value)
+    global_map.frame2match.ranges.push(edge_data["frame2match_ranges"])
+    global_map.frame2match.num_ranges.push(edge_data["frame2match_deg"])
+    global_map.point2match.edges.push(edge_data["point2match_edges"])
+    global_map.point2match.out_deg.push(edge_data["point2match_deg"])
+    global_map.match2point.mapping.push(edge_data["match2point"])
+    global_map.match2frame1.mapping.push(edge_data["match2frame1"])
+    global_map.match2frame2.mapping.push(edge_data["match2frame2"])
     return global_map
 
 
