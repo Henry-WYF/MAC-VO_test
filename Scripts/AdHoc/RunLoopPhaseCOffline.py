@@ -25,7 +25,6 @@ from Utility.Sandbox import Sandbox
 from Utility.Trajectory import Trajectory
 
 
-EXPECTED_LOOP_EDGES = 4
 POSE_ATOL = 1e-5
 POSE_RTOL = 1e-6
 
@@ -65,7 +64,7 @@ def _edge_key(row: dict[str, Any]) -> tuple[int, int]:
 
 
 def load_phase_c_edges(phase_b_dir: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    """Validate and associate the four selected Phase B edges in their final direction."""
+    """Validate and associate selected, comparison-eligible Phase B edges."""
     verification = _load_json(phase_b_dir / "loop_vins_verification.json")
     fixed_payload = _load_json(phase_b_dir / "loop_constraints_pgo_fixed.json")
     covariance_payload = _load_json(phase_b_dir / "loop_constraints_pgo_covariance.json")
@@ -134,11 +133,12 @@ def load_phase_c_edges(phase_b_dir: Path) -> tuple[list[dict[str, Any]], list[di
     fixed_by_key = constraint_map(fixed_rows, "fixed")
     covariance_by_key = constraint_map(covariance_rows, "covariance")
     keys = set(verification_by_key)
-    if not (
-        len(keys) == len(fixed_by_key) == len(covariance_by_key) == EXPECTED_LOOP_EDGES
-        and keys == set(fixed_by_key) == set(covariance_by_key)
-    ):
-        raise ValueError("Phase C requires exactly four identical verification/fixed/covariance edges")
+    if not keys:
+        if fixed_by_key or covariance_by_key:
+            raise ValueError("Phase C zero selected verification edges disagree with fixed/covariance edges")
+        return [], [], []
+    if keys != set(fixed_by_key) or keys != set(covariance_by_key):
+        raise ValueError("Phase C requires identical verification/fixed/covariance edge sets")
 
     ordered_keys = sorted(keys)
     for key in ordered_keys:
@@ -193,8 +193,10 @@ def load_phase_c_map(map_path: Path) -> tuple[VisualMap, torch.Tensor, torch.Ten
 def sensor_to_body_timed(
     sensor_poses: torch.Tensor, body_to_sensor: torch.Tensor, timestamps: np.ndarray,
 ) -> np.ndarray:
-    sensor = pp.SE3(sensor_poses.detach().cpu().double())
-    extrinsic = pp.SE3(body_to_sensor.detach().cpu().double())
+    # Match the formal VO export path exactly: the sensor-to-body conjugation
+    # is intentionally evaluated from the original float32 tensors.
+    sensor = pp.SE3(sensor_poses.detach().cpu())
+    extrinsic = pp.SE3(body_to_sensor.detach().cpu())
     body = (extrinsic @ sensor @ extrinsic.Inv()).tensor().numpy()
     return np.concatenate([np.asarray(timestamps, dtype=np.float64).reshape(-1, 1), body], axis=1)
 
@@ -430,6 +432,22 @@ def main() -> None:
             raise FileNotFoundError(path)
 
     verification_rows, fixed_rows, covariance_rows = load_phase_c_edges(phase_b_dir)
+    if not fixed_rows:
+        comparison = {
+            "schema_version": 1,
+            "source_result_dir": str(result_dir),
+            "source_phase_b_dir": str(phase_b_dir),
+            "code_commit": _git_commit(Path(__file__).resolve().parents[2]),
+            "loop_edge_count": 0,
+            "executed": False,
+            "reason": "no_pgo_comparison_eligible_edges",
+        }
+        _write_json(output_dir / "phase_c_comparison.json", comparison)
+        with (output_dir / "phase_c_metrics.csv").open("w", encoding="utf-8", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=("branch", "classification"))
+            writer.writeheader()
+        print("Phase C skipped: no PGO comparison eligible loop edges")
+        return
     global_map, time_ns, body_to_sensor = load_phase_c_map(result_dir / "tensor_map.npz")
     initial = global_map.frames.data["pose"].tensor.detach().clone()
     source_poses = np.load(result_dir / "poses.npy", allow_pickle=False)
@@ -448,7 +466,7 @@ def main() -> None:
         raise RuntimeError("Phase C modified the source VisualMap poses")
 
     unavailable_residual = {
-        "count": EXPECTED_LOOP_EDGES, "mean": None, "rmse": None, "max": None,
+        "count": len(fixed_rows), "mean": None, "rmse": None, "max": None,
         "reason": "unsafe_pgo_result",
     }
     fixed_residual = (
@@ -552,7 +570,7 @@ def main() -> None:
             "metric_tolerance": "max(1e-9, 1e-6 * abs(baseline))",
             "loop_residual_interpretation": "unweighted SE3 Log norm; mixed metres and radians",
         },
-        "loop_edge_count": EXPECTED_LOOP_EDGES,
+        "loop_edge_count": len(fixed_rows),
         "edge_diagnostics": edge_diagnostics,
         "original_pose_invariant": original_pose_invariant,
         "branches": {

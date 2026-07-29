@@ -1,0 +1,5 @@
+type: KITTI
+name: K09
+args:
+  root: /data/KITTI_odometry/sequences/09
+  gt_pose: true

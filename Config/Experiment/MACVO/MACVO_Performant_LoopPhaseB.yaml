@@ -74,8 +74,8 @@ Odometry:
 
   loop_closure:
     enabled: true
-    recognizer_type: custom_binary
-    vocabulary_path: ./Model/ORB_BoW_4096.npz
+    recognizer_type: dbow2_orb
+    vocabulary_path: ./Model/ORBvoc.txt
     bow_min_score: null
     keyframe_stride_sensor_frames: 10
     temporal_exclusion_sensor_frames: 100

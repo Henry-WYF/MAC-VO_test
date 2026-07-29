@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pypose as pp
 import pytest
 import torch
 
@@ -15,7 +16,7 @@ def _write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
-def _phase_b_inputs(root: Path) -> None:
+def _phase_b_inputs(root: Path, edge_count: int = 4) -> None:
     records = []
     verifications = []
     fixed = []
@@ -23,7 +24,7 @@ def _phase_b_inputs(root: Path) -> None:
     identity = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
     fixed_information = np.eye(6).tolist()
     covariance_information = (np.eye(6) * 0.5).tolist()
-    for offset in range(4):
+    for offset in range(edge_count):
         candidate_sensor = 100 + offset
         current_sensor = 200 + offset
         candidate_visual = 10 + offset
@@ -80,15 +81,20 @@ def _phase_b_inputs(root: Path) -> None:
 
 
 def test_phase_c_edge_association_filters_and_fixes_direction(tmp_path: Path) -> None:
-    _phase_b_inputs(tmp_path)
+    _phase_b_inputs(tmp_path, edge_count=3)
     verification, fixed, covariance = phase_c.load_phase_c_edges(tmp_path)
-    assert len(verification) == len(fixed) == len(covariance) == 4
+    assert len(verification) == len(fixed) == len(covariance) == 3
     assert [phase_c._edge_key(row) for row in fixed] == [
-        (10, 20), (11, 21), (12, 22), (13, 23),
+        (10, 20), (11, 21), (12, 22),
     ]
     assert [phase_c._edge_key(row) for row in fixed] == [
         phase_c._edge_key(row) for row in covariance
     ]
+
+
+def test_phase_c_edge_association_allows_zero_edges(tmp_path: Path) -> None:
+    _phase_b_inputs(tmp_path, edge_count=0)
+    assert phase_c.load_phase_c_edges(tmp_path) == ([], [], [])
 
 
 def test_phase_c_edge_association_rejects_duplicate_selected_edge(tmp_path: Path) -> None:
@@ -149,6 +155,25 @@ def test_sensor_to_body_validation_accepts_quaternion_sign(tmp_path: Path) -> No
     timestamps = torch.tensor([123], dtype=torch.long)
     source = np.array([[123.0, 0.0, 0.0, 0.0, -0.0, -0.0, -0.0, -1.0]])
     phase_c.validate_source_trajectory(source, sensor, extrinsic, timestamps)
+
+
+def test_sensor_to_body_matches_float32_export_with_rotated_extrinsic() -> None:
+    sensor = torch.tensor([
+        [0.1, -0.2, 0.3, 0.92736185, 125000.125, -98000.25, 76500.5],
+        [-0.3, 0.2, 0.1, 0.92736185, -225000.5, 198000.75, -176500.25],
+    ], dtype=torch.float32)
+    body_to_sensor = torch.tensor([
+        [0.70710677, 0.0, 0.0, 0.70710677, 1.25, -2.5, 3.75],
+        [0.70710677, 0.0, 0.0, 0.70710677, 1.25, -2.5, 3.75],
+    ], dtype=torch.float32)
+    timestamps = torch.tensor([1000, 2000], dtype=torch.long)
+    expected = (
+        pp.SE3(body_to_sensor) @ pp.SE3(sensor) @ pp.SE3(body_to_sensor).Inv()
+    ).tensor().numpy()
+    reconstructed = phase_c.sensor_to_body_timed(sensor, body_to_sensor, timestamps.numpy())
+    assert np.array_equal(reconstructed[:, 1:], expected)
+    source = np.concatenate([timestamps.numpy().reshape(-1, 1), expected], axis=1)
+    phase_c.validate_source_trajectory(source, sensor, body_to_sensor, timestamps)
 
 
 def test_no_loop_branch_copies_source_pose_and_optional_status(tmp_path: Path) -> None:
