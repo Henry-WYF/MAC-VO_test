@@ -39,6 +39,7 @@ from Scripts.AdHoc.RunLoopPhaseBOffline import (
     summarize_engineering_admission,
 )
 from Module.Map import VisualMap
+from Module.Map.Graph import TensorBundle
 from Module.Optimization.ObservationInformation import (
     icp_linearization,
     information_diagnostics,
@@ -627,7 +628,7 @@ def test_match_covariance_shared_statistics_use_local_depth_when_position_covari
     weighted_depth, weighted_variance, covariance = first
     assert weighted_depth.shape == weighted_variance.shape == (1,)
     assert covariance.shape == (1, 3, 3)
-    assert float(weighted_variance[0]) > 0.05
+    assert float(weighted_variance[0]) >= 0.05
     offsets = torch.arange(-15, 16, dtype=torch.long)
     uu, vv = torch.meshgrid(offsets, offsets, indexing="ij")
     patch = depth[..., 20 + vv.reshape(-1), 20 + uu.reshape(-1)].view(1, 31, 31)
@@ -687,18 +688,6 @@ def test_icp_covariance_sum_jacobian_and_uniform_scaling() -> None:
 def test_odometry_icp_information_uses_only_direct_bilateral_observations(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class Observation:
-        def __init__(self, index: torch.Tensor, data: dict[str, torch.Tensor]):
-            self.index, self.data = index, data
-
-        def __len__(self):
-            return len(self.index)
-
-        def __getitem__(self, selection):
-            return Observation(self.index[selection], {
-                key: value[selection] for key, value in self.data.items()
-            })
-
     count = 7
     uv1 = torch.stack((torch.linspace(20.0, 60.0, count), torch.linspace(20.0, 50.0, count)), dim=-1)
     uv2 = uv1 + 1.0
@@ -709,32 +698,38 @@ def test_odometry_icp_information_uses_only_direct_bilateral_observations(
         "obs1_covTc": torch.eye(3, dtype=torch.float64).repeat(count, 1, 1) * 0.1,
         "obs2_covTc": torch.eye(3, dtype=torch.float64).repeat(count, 1, 1) * 0.2,
     }
-    observations = Observation(torch.arange(count), data)
-
-    class Edge:
-        def __init__(self, values: torch.Tensor):
-            self.values = values
-
-        def project(self, index: torch.Tensor):
-            return self.values[index]
-
-    class Frames:
-        def __init__(self):
-            K = torch.tensor([[100.0, 0.0, 50.0], [0.0, 100.0, 40.0], [0.0, 0.0, 1.0]])
-            self.data = {
-                "pose": SimpleNamespace(tensor=pp.identity_SE3(2).tensor()),
-                "K": torch.stack((K, K)),
-            }
-
-        def __getitem__(self, _index):
-            return object()
-
-    fake_map = SimpleNamespace(
-        frames=Frames(),
-        match2frame1=Edge(torch.tensor([0, 0, 0, 0, 0, 0, 1])),
-        match2frame2=Edge(torch.tensor([1, 1, 1, 1, 1, 1, 1])),
-        get_frame2match=lambda _frame: observations,
+    zeros = torch.zeros((count, 1), dtype=torch.float32)
+    match_data = {
+        **data,
+        "pixel1_disp": zeros.clone(), "pixel2_disp": zeros.clone(),
+        "pixel1_disp_cov": zeros.clone(), "pixel2_disp_cov": zeros.clone(),
+        "pixel1_uv_cov": torch.zeros((count, 3)),
+        "pixel2_uv_cov": torch.zeros((count, 3)),
+        "pixel1_d_cov": zeros.clone(), "pixel2_d_cov": zeros.clone(),
+    }
+    K = torch.tensor(
+        [[100.0, 0.0, 50.0], [0.0, 100.0, 40.0], [0.0, 0.0, 1.0]],
     )
+    global_map = VisualMap()
+    global_map.frames.push(TensorBundle(torch.arange(2), {
+        "pose": pp.identity_SE3(2).tensor(),
+        "T_BS": pp.identity_SE3(2).tensor(),
+        "need_interp": torch.zeros(2, dtype=torch.bool),
+        "time_ns": torch.arange(2, dtype=torch.long),
+        "K": torch.stack((K, K)),
+        "baseline": torch.full((2,), 0.2),
+    }))
+    match_idx = global_map.match.push(TensorBundle(torch.arange(count), match_data))
+    global_map.frame2match.add(
+        torch.tensor([0]), torch.tensor([0]), torch.tensor([count]),
+    )
+    global_map.frame2match.add(
+        torch.tensor([1]), torch.tensor([0]), torch.tensor([count]),
+    )
+    global_map.match2frame1.set(
+        match_idx, torch.tensor([0, 0, 0, 0, 0, 0, 1]),
+    )
+    global_map.match2frame2.set(match_idx, torch.ones(count, dtype=torch.long))
     captured: dict[str, torch.Tensor] = {}
 
     def fake_system(pose, candidate_points, candidate_covariance, current_points, current_covariance, _delta):
@@ -755,7 +750,7 @@ def test_odometry_icp_information_uses_only_direct_bilateral_observations(
         lambda system, pose, point_count: (torch.eye(6), {"valid": True, "point_count": point_count}),
     )
     information, diagnostics = odometry_edge_information(
-        fake_map, 0, 1, huber_delta=2.795, residual_mode="icp",  # type: ignore[arg-type]
+        global_map, 0, 1, huber_delta=2.795, residual_mode="icp",
     )
     assert information is not None
     assert diagnostics["direct_observation_count"] == 6

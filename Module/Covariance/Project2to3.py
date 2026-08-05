@@ -176,10 +176,15 @@ def match_covariance_local_statistics(
     else:
         weighted_variance = depth_covariance.to(device=device)
     weighted_variance = weighted_variance.clamp(min=float(min_depth_variance))
+    # Covariance_2to3_full deliberately keeps scalar intrinsics in its public
+    # contract. Runtime type checking therefore requires Python floats even
+    # when callers obtain the four scalars by indexing a tensor intrinsic.
+    fx_value, fy_value = float(fx), float(fy)
+    cx_value, cy_value = float(cx), float(cy)
     covariance_3d = Covariance_2to3_full(
         var_u, var_uv, var_v, weighted_variance,
         kp[..., 0], kp[..., 1], weighted_depth,
-        fx, fy, cx, cy,
+        fx_value, fy_value, cx_value, cy_value,
     ).double()
     return weighted_depth, weighted_variance, covariance_3d
 
