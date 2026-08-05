@@ -29,16 +29,25 @@ from Module.LoopClosure.VINSGeometry import (
     verify_fixed_geometry,
 )
 from Module.LoopClosure.Verification import LoopConstraint
+from Module.Covariance.Project2to3 import (
+    Covariance_2to3_full,
+    create_2x2_matrix,
+    match_covariance_local_statistics,
+)
 from Scripts.AdHoc.RunLoopPhaseBOffline import (
     run_vins_pose_copy_pgo,
     summarize_engineering_admission,
 )
 from Module.Map import VisualMap
 from Module.Optimization.ObservationInformation import (
+    icp_linearization,
     information_diagnostics,
+    odometry_edge_information,
+    robust_icp_observation_system,
     robust_observation_system,
 )
 from Utility.Point import pixel2point_NED
+from Utility.Math import gaussain_full_kernels
 
 
 def geometry_record(descriptors: torch.Tensor, original: torch.Tensor | None = None) -> GeometryFeatureRecord:
@@ -127,6 +136,7 @@ class SyntheticRefinementFrontend:
         self.covariance[:, :2] = 0.25
         self.disparity = torch.ones((1, 1, 80, 100))
         self.disparity_variance = torch.full((1, 1, 80, 100), 0.1)
+        self.depth = torch.ones((1, 1, 80, 100))
         for index, (uv, disparity) in enumerate(
             zip(geometry.pixel_uv, geometry.disparity)
         ):
@@ -138,6 +148,7 @@ class SyntheticRefinementFrontend:
     def estimate_pair(self, _historical, _current):
         self.calls += 1
         depth = SimpleNamespace(
+            depth=self.depth,
             disparity=self.disparity,
             disparity_uncertainty=self.disparity_variance,
         )
@@ -593,6 +604,187 @@ def test_robust_observation_information_uses_covariance_sum_and_is_full_rank() -
     assert information is not None
     assert diagnostics["rank"] == 6
     assert diagnostics["normalization"] == "raw_robust_hessian_no_lm_damping"
+
+
+def test_match_covariance_shared_statistics_use_local_depth_when_position_covariance_exists() -> None:
+    depth = torch.arange(41 * 41, dtype=torch.float64).reshape(1, 1, 41, 41) / 100.0 + 1.0
+    kp = torch.tensor([[20.0, 20.0]], dtype=torch.float64)
+    position_covariance = torch.tensor([[0.25, 0.36, 0.02]], dtype=torch.float64)
+    common = dict(
+        kp=kp, depth=depth, position_covariance=position_covariance,
+        kernel_size=31, match_cov_default=0.25, min_position_std=0.25,
+        min_depth_variance=0.05, fx=100.0, fy=110.0, cx=20.0, cy=20.0,
+        device=torch.device("cpu"),
+    )
+    first = match_covariance_local_statistics(
+        depth_covariance=torch.tensor([1e-4], dtype=torch.float64), **common,
+    )
+    second = match_covariance_local_statistics(
+        depth_covariance=torch.tensor([100.0], dtype=torch.float64), **common,
+    )
+    for left, right in zip(first, second):
+        assert torch.equal(left, right)
+    weighted_depth, weighted_variance, covariance = first
+    assert weighted_depth.shape == weighted_variance.shape == (1,)
+    assert covariance.shape == (1, 3, 3)
+    assert float(weighted_variance[0]) > 0.05
+    offsets = torch.arange(-15, 16, dtype=torch.long)
+    uu, vv = torch.meshgrid(offsets, offsets, indexing="ij")
+    patch = depth[..., 20 + vv.reshape(-1), 20 + uu.reshape(-1)].view(1, 31, 31)
+    patch = patch.permute(0, 2, 1)
+    matrix = create_2x2_matrix(
+        [[position_covariance[:, 0], position_covariance[:, 2]],
+         [position_covariance[:, 2], position_covariance[:, 1]]],
+        n_sample=1, device=torch.device("cpu"),
+    )
+    weights = gaussain_full_kernels(matrix, kernel_size=31)
+    expected_mean = (weights * patch).sum(dim=(1, 2))
+    expected_variance = (
+        weights * (patch - expected_mean[:, None, None]).square()
+    ).sum(dim=(1, 2)).clamp_min(0.05)
+    expected_covariance = Covariance_2to3_full(
+        position_covariance[:, 0], position_covariance[:, 2],
+        position_covariance[:, 1], expected_variance,
+        kp[:, 0], kp[:, 1], expected_mean, 100.0, 110.0, 20.0, 20.0,
+    ).double()
+    assert torch.equal(weighted_depth, expected_mean)
+    assert torch.equal(weighted_variance, expected_variance)
+    assert torch.equal(covariance, expected_covariance)
+
+
+def test_icp_covariance_sum_jacobian_and_uniform_scaling() -> None:
+    points = torch.tensor([
+        [2.0, -0.5, -0.3], [2.2, 0.4, -0.2], [2.5, -0.3, 0.4],
+        [3.0, 0.5, 0.3], [3.5, -0.6, 0.2], [4.0, 0.2, -0.4],
+    ], dtype=torch.float64)
+    pose = pp.identity_SE3(1).double()
+    covariance_a = torch.eye(3, dtype=torch.float64).repeat(len(points), 1, 1) * 0.01
+    covariance_b = torch.eye(3, dtype=torch.float64).repeat(len(points), 1, 1) * 0.02
+    residual, jacobian, covariance, transformed = icp_linearization(
+        pose, points, covariance_a, points, covariance_b,
+    )
+    assert torch.allclose(residual, torch.zeros_like(residual))
+    assert torch.allclose(covariance, covariance_a + covariance_b)
+    epsilon = 1e-6
+    numerical = torch.empty_like(jacobian)
+    for axis in range(6):
+        delta = torch.zeros(6, dtype=torch.float64)
+        delta[axis] = epsilon
+        plus = (pp.se3(delta).Exp() @ pose).Act(points)
+        minus = (pp.se3(-delta).Exp() @ pose).Act(points)
+        numerical[:, :, axis] = (plus - minus) / (2.0 * epsilon)
+    assert torch.allclose(jacobian, numerical, atol=1e-6, rtol=1e-5)
+    base = robust_icp_observation_system(
+        pose, points, covariance_a, points, covariance_b, 2.795,
+    )
+    enlarged = robust_icp_observation_system(
+        pose, points, covariance_a * 4.0, points, covariance_b * 4.0, 2.795,
+    )
+    assert torch.linalg.eigvalsh(base.hessian - enlarged.hessian).min() >= -1e-8
+    assert transformed.shape == points.shape
+
+
+def test_odometry_icp_information_uses_only_direct_bilateral_observations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Observation:
+        def __init__(self, index: torch.Tensor, data: dict[str, torch.Tensor]):
+            self.index, self.data = index, data
+
+        def __len__(self):
+            return len(self.index)
+
+        def __getitem__(self, selection):
+            return Observation(self.index[selection], {
+                key: value[selection] for key, value in self.data.items()
+            })
+
+    count = 7
+    uv1 = torch.stack((torch.linspace(20.0, 60.0, count), torch.linspace(20.0, 50.0, count)), dim=-1)
+    uv2 = uv1 + 1.0
+    data = {
+        "pixel1_uv": uv1, "pixel2_uv": uv2,
+        "pixel1_d": torch.full((count, 1), 3.0),
+        "pixel2_d": torch.full((count, 1), 3.1),
+        "obs1_covTc": torch.eye(3, dtype=torch.float64).repeat(count, 1, 1) * 0.1,
+        "obs2_covTc": torch.eye(3, dtype=torch.float64).repeat(count, 1, 1) * 0.2,
+    }
+    observations = Observation(torch.arange(count), data)
+
+    class Edge:
+        def __init__(self, values: torch.Tensor):
+            self.values = values
+
+        def project(self, index: torch.Tensor):
+            return self.values[index]
+
+    class Frames:
+        def __init__(self):
+            K = torch.tensor([[100.0, 0.0, 50.0], [0.0, 100.0, 40.0], [0.0, 0.0, 1.0]])
+            self.data = {
+                "pose": SimpleNamespace(tensor=pp.identity_SE3(2).tensor()),
+                "K": torch.stack((K, K)),
+            }
+
+        def __getitem__(self, _index):
+            return object()
+
+    fake_map = SimpleNamespace(
+        frames=Frames(),
+        match2frame1=Edge(torch.tensor([0, 0, 0, 0, 0, 0, 1])),
+        match2frame2=Edge(torch.tensor([1, 1, 1, 1, 1, 1, 1])),
+        get_frame2match=lambda _frame: observations,
+    )
+    captured: dict[str, torch.Tensor] = {}
+
+    def fake_system(pose, candidate_points, candidate_covariance, current_points, current_covariance, _delta):
+        captured.update({
+            "candidate_points": candidate_points,
+            "candidate_covariance": candidate_covariance,
+            "current_points": current_points,
+            "current_covariance": current_covariance,
+        })
+        return SimpleNamespace(transformed=candidate_points)
+
+    monkeypatch.setattr(
+        "Module.Optimization.ObservationInformation.robust_icp_observation_system",
+        fake_system,
+    )
+    monkeypatch.setattr(
+        "Module.Optimization.ObservationInformation.information_diagnostics",
+        lambda system, pose, point_count: (torch.eye(6), {"valid": True, "point_count": point_count}),
+    )
+    information, diagnostics = odometry_edge_information(
+        fake_map, 0, 1, huber_delta=2.795, residual_mode="icp",  # type: ignore[arg-type]
+    )
+    assert information is not None
+    assert diagnostics["direct_observation_count"] == 6
+    assert len(captured["candidate_points"]) == 6
+    assert torch.equal(captured["candidate_covariance"], data["obs1_covTc"][:6])
+    assert torch.equal(captured["current_covariance"], data["obs2_covTc"][:6])
+
+
+def test_network_icp_refinement_uses_bilateral_local_covariance() -> None:
+    result, current_frame, historical_frame, current, historical = refinement_input()
+    frontend = SyntheticRefinementFrontend(historical)
+    refined = refine_geometry_with_network(
+        result,
+        SimpleNamespace(
+            residual_mode="icp", min_points=6, huber_delta=2.795,
+            max_iterations=3, damping_initial=1e-3, kernel_size=31,
+            match_cov_default=0.25, min_depth_cov=0.05, min_flow_cov=0.25,
+        ),
+        frontend, current_frame, historical_frame, current, historical,
+        torch.eye(6, dtype=torch.float64) * 100.0, 20.0, 180.0,
+    )
+    assert frontend.calls == 1
+    assert refined.constraint is not None
+    assert refined.covariance_information is not None
+    diagnostics = refined.row["network_refinement"]
+    assert diagnostics["status"] == "succeeded"
+    assert diagnostics["residual_mode"] == "icp"
+    assert diagnostics["kernel_size"] == 31
+    assert diagnostics["local_depth_valid_points"] == 8
 
 
 def test_network_refinement_succeeds_with_one_frontend_inference() -> None:

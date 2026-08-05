@@ -37,6 +37,7 @@ from .VINSGeometry import (
     cached_orb_geometry,
     fixed_loop_information,
     fixed_point_covariance,
+    network_refinement_contract,
     refine_geometry_with_network,
     verify_fixed_geometry,
 )
@@ -272,6 +273,12 @@ class LoopClosureManager(ConfigTestable):
                     "huber_delta": lambda value: _is_number(value, lambda item: item > 0.0),
                     "max_iterations": lambda value: _is_int(value, lambda item: item > 0),
                     "damping_initial": lambda value: _is_number(value, lambda item: item > 0.0),
+                }, {
+                    "residual_mode": lambda value: value in {"disp", "icp"},
+                    "kernel_size": lambda value: _is_int(value, lambda item: item > 0 and item % 2 == 1),
+                    "match_cov_default": lambda value: _is_number(value, lambda item: item > 0.0),
+                    "min_depth_cov": lambda value: _is_number(value, lambda item: item > 0.0),
+                    "min_flow_cov": lambda value: _is_number(value, lambda item: item > 0.0),
                 })
 
     def set_frontend(self, frontend: IFrontend) -> None:
@@ -1174,6 +1181,9 @@ class LoopClosureManager(ConfigTestable):
 
         if not torch.equal(poses, pose_snapshot):
             raise RuntimeError("VINS-style loop verification modified VisualMap poses")
+        refinement_contract = network_refinement_contract(
+            network_refinement if network_refinement_enabled else None,
+        )
         payload = {
             "schema_version": 1,
             "mode": (
@@ -1183,6 +1193,7 @@ class LoopClosureManager(ConfigTestable):
             ),
             "feature_source": feature_source,
             "descriptor_match_mode": descriptor_match_mode,
+            **refinement_contract,
             "summary": {
                 "attempted_pairs": len(rows),
                 "geometry_accepted_pairs": sum(row.get("geometry_accepted") is True for row in rows),
@@ -1205,6 +1216,7 @@ class LoopClosureManager(ConfigTestable):
             "schema_version": 1,
             "feature_source": feature_source,
             "descriptor_match_mode": descriptor_match_mode,
+            **refinement_contract,
             "pose_direction": "relative_pose = T_candidate_current = inverse(T_current_candidate)",
             "information_policy": "fixed_information; covariance information is observe-only",
             "constraints": [constraint.to_dict() for constraint in selected_constraints],
@@ -1213,6 +1225,7 @@ class LoopClosureManager(ConfigTestable):
             "schema_version": 1,
             "feature_source": feature_source,
             "descriptor_match_mode": descriptor_match_mode,
+            **refinement_contract,
             "information_policy": "fixed_information",
             "constraints": pgo_fixed_constraints,
         }
@@ -1220,8 +1233,9 @@ class LoopClosureManager(ConfigTestable):
             "schema_version": 1,
             "feature_source": feature_source,
             "descriptor_match_mode": descriptor_match_mode,
+            **refinement_contract,
             "information_policy": (
-                "network_reprojection_disparity_raw_robust_hessian"
+                f"network_{refinement_contract['loop_residual_mode']}_raw_robust_hessian"
                 if network_refinement_enabled
                 else "disp_covariance_information_observe"
             ),

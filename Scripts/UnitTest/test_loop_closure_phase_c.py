@@ -9,6 +9,7 @@ import pypose as pp
 import pytest
 import torch
 
+from Module.LoopClosure.VINSGeometry import network_refinement_contract
 from Scripts.AdHoc import RunLoopPhaseCOffline as phase_c
 
 
@@ -115,6 +116,127 @@ def test_phase_c_edge_association_rejects_relative_pose_difference(tmp_path: Pat
     _write_json(path, payload)
     with pytest.raises(ValueError, match="relative poses differ"):
         phase_c.load_phase_c_edges(tmp_path)
+
+
+def test_phase_c_rejects_disp_or_mismatched_icp_manifest(tmp_path: Path) -> None:
+    refinement = SimpleNamespace(
+        residual_mode="icp", kernel_size=31, match_cov_default=0.25,
+        min_depth_cov=0.05, min_flow_cov=0.25,
+    )
+    contract = network_refinement_contract(refinement)
+    for name in (
+        "offline_run_manifest.json", "loop_vins_verification.json",
+        "loop_constraints_pgo_fixed.json", "loop_constraints_pgo_covariance.json",
+    ):
+        _write_json(tmp_path / name, {
+            **contract,
+            "vo_graph_type": "icp",
+            "odometry_residual_mode": "icp",
+        })
+    config = SimpleNamespace(Odometry=SimpleNamespace(
+        optimizer=SimpleNamespace(args=SimpleNamespace(graph_type="icp")),
+        global_pgo=SimpleNamespace(observation_residual_mode="icp"),
+        loop_closure=SimpleNamespace(vins_geometry=SimpleNamespace(
+            network_refinement=refinement,
+        )),
+        cov=SimpleNamespace(obs=SimpleNamespace(type="MatchCovariance", args=SimpleNamespace(
+            kernel_size=31, match_cov_default=0.25,
+            min_depth_cov=0.05, min_flow_cov=0.25,
+        ))),
+    ))
+    observed = phase_c.validate_icp_phase_b_contract(tmp_path, config)
+    assert observed["loop_residual_mode"] == "icp"
+    payload = json.loads((tmp_path / "loop_constraints_pgo_fixed.json").read_text())
+    payload["loop_residual_mode"] = "disp"
+    _write_json(tmp_path / "loop_constraints_pgo_fixed.json", payload)
+    with pytest.raises(ValueError, match="residual modes disagree"):
+        phase_c.validate_icp_phase_b_contract(tmp_path, config)
+
+
+def test_phase_c_rejects_icp_with_disp_odometry_mode(tmp_path: Path) -> None:
+    refinement = SimpleNamespace(
+        residual_mode="icp", kernel_size=31, match_cov_default=0.25,
+        min_depth_cov=0.05, min_flow_cov=0.25,
+    )
+    contract = network_refinement_contract(refinement)
+    for name in (
+        "offline_run_manifest.json", "loop_vins_verification.json",
+        "loop_constraints_pgo_fixed.json", "loop_constraints_pgo_covariance.json",
+    ):
+        _write_json(tmp_path / name, {
+            **contract,
+            "vo_graph_type": "icp",
+            "odometry_residual_mode": "disp",
+        })
+    config = SimpleNamespace(Odometry=SimpleNamespace(
+        optimizer=SimpleNamespace(args=SimpleNamespace(graph_type="icp")),
+        global_pgo=SimpleNamespace(observation_residual_mode="disp"),
+        loop_closure=SimpleNamespace(vins_geometry=SimpleNamespace(
+            network_refinement=refinement,
+        )),
+        cov=SimpleNamespace(obs=SimpleNamespace(type="MatchCovariance", args=SimpleNamespace(
+            kernel_size=31, match_cov_default=0.25,
+            min_depth_cov=0.05, min_flow_cov=0.25,
+        ))),
+    ))
+    with pytest.raises(ValueError, match="observation_residual_mode disagrees"):
+        phase_c.validate_phase_b_contract(tmp_path, config)
+
+
+def test_phase_c_accepts_legacy_disp_ablation(tmp_path: Path) -> None:
+    for name in (
+        "offline_run_manifest.json", "loop_vins_verification.json",
+        "loop_constraints_pgo_fixed.json", "loop_constraints_pgo_covariance.json",
+    ):
+        _write_json(tmp_path / name, {})
+    config = SimpleNamespace(Odometry=SimpleNamespace(
+        optimizer=SimpleNamespace(args=SimpleNamespace(graph_type="disp")),
+    ))
+    observed = phase_c.validate_phase_b_contract(tmp_path, config)
+    assert observed == {
+        "vo_graph_type": "disp",
+        "loop_residual_mode": "disp",
+        "odometry_residual_mode": "disp",
+        "observation_covariance_model": "legacy_reprojection_disparity",
+        "kernel_size": None,
+        "covariance_config_sha256": None,
+        "contract_validation": "legacy_disp_source_config",
+    }
+
+
+def test_phase_c_rejects_partial_legacy_disp_metadata(tmp_path: Path) -> None:
+    for name in (
+        "offline_run_manifest.json", "loop_vins_verification.json",
+        "loop_constraints_pgo_fixed.json", "loop_constraints_pgo_covariance.json",
+    ):
+        _write_json(tmp_path / name, {})
+    payload = {"covariance_config_sha256": "partial-new-contract"}
+    _write_json(tmp_path / "loop_constraints_pgo_fixed.json", payload)
+    config = SimpleNamespace(Odometry=SimpleNamespace(
+        optimizer=SimpleNamespace(args=SimpleNamespace(graph_type="disp")),
+    ))
+    with pytest.raises(ValueError, match="partial contract metadata"):
+        phase_c.validate_phase_b_contract(tmp_path, config)
+
+
+def test_phase_c_accepts_explicit_disp_ablation(tmp_path: Path) -> None:
+    contract = network_refinement_contract(SimpleNamespace(residual_mode="disp"))
+    for name in (
+        "offline_run_manifest.json", "loop_vins_verification.json",
+        "loop_constraints_pgo_fixed.json", "loop_constraints_pgo_covariance.json",
+    ):
+        _write_json(tmp_path / name, {
+            **contract,
+            "vo_graph_type": "disp",
+            "odometry_residual_mode": "disp",
+        })
+    config = SimpleNamespace(Odometry=SimpleNamespace(
+        optimizer=SimpleNamespace(args=SimpleNamespace(graph_type="disp")),
+        global_pgo=SimpleNamespace(observation_residual_mode="disp"),
+    ))
+    observed = phase_c.validate_phase_b_contract(tmp_path, config)
+    assert observed["loop_residual_mode"] == "disp"
+    assert observed["contract_validation"] == "explicit_disp"
 
 
 def _metrics(ate: float, rpe: float) -> dict:

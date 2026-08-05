@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import time
 from dataclasses import dataclass, replace
@@ -12,12 +13,17 @@ import numpy as np
 import pypose as pp
 import torch
 
-from Module.Covariance.Project2to3 import Covariance_2to3_full
+from Module.Covariance.Project2to3 import (
+    Covariance_2to3_full,
+    match_covariance_local_statistics,
+)
 from Module.Frontend.Frontend import IFrontend
 from Module.Optimization.GlobalPGO import make_information
 from Module.Optimization.ObservationInformation import (
     covariance_triplet_to_matrix,
+    icp_linearization,
     information_diagnostics,
+    robust_icp_observation_system,
     robust_observation_system,
 )
 from Utility.Point import pixel2point_NED
@@ -33,6 +39,32 @@ ORB_SLAM_HAMMING_THRESHOLD = 50
 ORB_SLAM_RATIO_THRESHOLD = 0.9
 ORB_SLAM_ORIENTATION_BINS = 30
 ORB_SLAM_ORIENTATION_WEAK_BIN_RATIO = 0.1
+
+
+def network_refinement_contract(config: SimpleNamespace | None) -> dict[str, Any]:
+    residual_mode = "disp" if config is None else str(getattr(config, "residual_mode", "disp"))
+    covariance = {
+        "type": (
+            "bilateral_match_covariance_3d_independent_sum"
+            if residual_mode == "icp"
+            else "reprojection_disparity_candidate_3d_plus_measurement"
+        ),
+        "source_covariance_type": "MatchCovariance" if residual_mode == "icp" else None,
+        "kernel_size": None if residual_mode == "disp" else int(getattr(config, "kernel_size", 31)),
+        "match_cov_default": None if residual_mode == "disp" else float(getattr(config, "match_cov_default", 0.25)),
+        "min_depth_cov": None if residual_mode == "disp" else float(getattr(config, "min_depth_cov", 0.05)),
+        "min_flow_cov": None if residual_mode == "disp" else float(getattr(config, "min_flow_cov", 0.25)),
+        "candidate_position_covariance": None if residual_mode == "disp" else "fixed_0.25I",
+        "cross_view_covariance": "ignored_independent_approximation",
+    }
+    canonical = json.dumps(covariance, sort_keys=True, separators=(",", ":"))
+    return {
+        "loop_residual_mode": residual_mode,
+        "observation_covariance_model": covariance["type"],
+        "kernel_size": covariance["kernel_size"],
+        "covariance_config_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        "covariance_config": covariance,
+    }
 
 
 @dataclass(frozen=True)
@@ -646,6 +678,9 @@ def refine_geometry_with_network(
     max_rotation_deg: float,
 ) -> GeometryResult:
     """Refine one ORB/PnP-approved pair with one historical-to-current network match."""
+    residual_mode = str(getattr(config, "residual_mode", "disp"))
+    if residual_mode not in {"disp", "icp"}:
+        raise ValueError(f"unsupported network refinement residual mode {residual_mode!r}")
     row = result.row
     refinement: dict[str, Any] = {
         "enabled": True,
@@ -657,6 +692,12 @@ def refine_geometry_with_network(
         "cross_covariance_mode": "ignored_independent_approximation",
         "huber_delta": float(getattr(config, "huber_delta", 2.795)),
         "min_points": int(getattr(config, "min_points", 6)),
+        "residual_mode": residual_mode,
+        "observation_covariance_model": (
+            "bilateral_match_covariance_3d_independent_sum"
+            if residual_mode == "icp"
+            else "reprojection_disparity_candidate_3d_plus_measurement"
+        ),
     }
     row["network_refinement"] = refinement
     if (
@@ -686,14 +727,27 @@ def refine_geometry_with_network(
     covariance_map = getattr(match, "cov", None)
     disparity_map = getattr(depth_current, "disparity", None)
     disparity_variance_map = getattr(depth_current, "disparity_uncertainty", None)
+    current_depth_map = getattr(depth_current, "depth", None)
     if (
         flow_map is None or covariance_map is None
-        or disparity_map is None or disparity_variance_map is None
         or flow_map.ndim != 4 or flow_map.shape[1] != 2
         or covariance_map.ndim != 4 or covariance_map.shape[1] != 3
-        or disparity_map.ndim != 4 or disparity_map.shape[1] != 1
-        or disparity_variance_map.ndim != 4
-        or disparity_variance_map.shape[1] != 1
+        or (
+            residual_mode == "disp"
+            and (
+                disparity_map is None or disparity_variance_map is None
+                or disparity_map.ndim != 4 or disparity_map.shape[1] != 1
+                or disparity_variance_map.ndim != 4
+                or disparity_variance_map.shape[1] != 1
+            )
+        )
+        or (
+            residual_mode == "icp"
+            and (
+                current_depth_map is None or current_depth_map.ndim != 4
+                or current_depth_map.shape[1] != 1
+            )
+        )
     ):
         refinement["reason"] = "missing_or_invalid_frontend_uncertainty"
         row.update({"information_valid": False, "pgo_comparison_eligible": False})
@@ -723,7 +777,9 @@ def refine_geometry_with_network(
     sampled_covariance = covariance_cpu[:, floor_source[:, 1], floor_source[:, 0]].T
     network_current_uv = candidate_uv[source_indices] + sampled_flow
     floor_current = torch.floor(network_current_uv).long()
-    current_height, current_width = int(disparity_map.shape[-2]), int(disparity_map.shape[-1])
+    geometry_map = disparity_map if residual_mode == "disp" else current_depth_map
+    assert geometry_map is not None
+    current_height, current_width = int(geometry_map.shape[-2]), int(geometry_map.shape[-1])
     current_inbound = (
         torch.isfinite(network_current_uv).all(dim=1)
         & (floor_current[:, 0] >= 0) & (floor_current[:, 0] < current_width)
@@ -733,40 +789,175 @@ def refine_geometry_with_network(
     if getattr(match, "mask", None) is not None:
         mask_cpu = match.mask[0, 0].detach().cpu().bool()
         mask_valid = mask_cpu[floor_source[:, 1], floor_source[:, 0]]
-    disparity_cpu = disparity_map[0, 0].detach().cpu().double()
-    disparity_variance_cpu = disparity_variance_map[0, 0].detach().cpu().double()
-    sampled_disparity = torch.full((len(source_indices),), torch.nan, dtype=torch.float64)
-    sampled_disparity_variance = torch.full_like(sampled_disparity, torch.nan)
-    if bool(current_inbound.any()):
-        uv = floor_current[current_inbound]
-        sampled_disparity[current_inbound] = disparity_cpu[uv[:, 1], uv[:, 0]]
-        sampled_disparity_variance[current_inbound] = (
-            disparity_variance_cpu[uv[:, 1], uv[:, 0]]
+    observation_arrays: dict[str, torch.Tensor]
+    intrinsic = (
+        current_frame.intrinsic[0]
+        if current_frame.intrinsic.ndim == 3 else current_frame.intrinsic
+    ).detach().cpu().double()
+    huber_delta = float(getattr(config, "huber_delta", 2.795))
+    valid_count = 0
+    if residual_mode == "disp":
+        assert disparity_map is not None and disparity_variance_map is not None
+        disparity_cpu = disparity_map[0, 0].detach().cpu().double()
+        disparity_variance_cpu = disparity_variance_map[0, 0].detach().cpu().double()
+        sampled_disparity = torch.full((len(source_indices),), torch.nan, dtype=torch.float64)
+        sampled_disparity_variance = torch.full_like(sampled_disparity, torch.nan)
+        if bool(current_inbound.any()):
+            uv = floor_current[current_inbound]
+            sampled_disparity[current_inbound] = disparity_cpu[uv[:, 1], uv[:, 0]]
+            sampled_disparity_variance[current_inbound] = (
+                disparity_variance_cpu[uv[:, 1], uv[:, 0]]
+            )
+        candidate_points = historical.point_camera[
+            candidate_local[source_indices]
+        ].detach().cpu().double()
+        candidate_covariance = historical.point_covariance_camera[
+            candidate_local[source_indices]
+        ].detach().cpu().double()
+        uv_covariance = covariance_triplet_to_matrix(sampled_covariance)
+        valid = (
+            current_inbound & mask_valid
+            & torch.isfinite(sampled_flow).all(dim=1)
+            & torch.isfinite(uv_covariance).all(dim=(1, 2))
+            & torch.isfinite(sampled_disparity)
+            & torch.isfinite(sampled_disparity_variance)
+            & (sampled_disparity > 0.0)
+            & (sampled_disparity_variance > 0.0)
+            & torch.isfinite(candidate_points).all(dim=1)
+            & torch.isfinite(candidate_covariance).all(dim=(1, 2))
+            & (candidate_points[:, 0] > 0.0)
         )
-    candidate_points = historical.point_camera[
-        candidate_local[source_indices]
-    ].detach().cpu().double()
-    candidate_covariance = historical.point_covariance_camera[
-        candidate_local[source_indices]
-    ].detach().cpu().double()
-    uv_covariance = covariance_triplet_to_matrix(sampled_covariance)
-    valid = (
-        current_inbound
-        & mask_valid
-        & torch.isfinite(sampled_flow).all(dim=1)
-        & torch.isfinite(uv_covariance).all(dim=(1, 2))
-        & torch.isfinite(sampled_disparity)
-        & torch.isfinite(sampled_disparity_variance)
-        & (sampled_disparity > 0.0)
-        & (sampled_disparity_variance > 0.0)
-        & torch.isfinite(candidate_points).all(dim=1)
-        & torch.isfinite(candidate_covariance).all(dim=(1, 2))
-        & (candidate_points[:, 0] > 0.0)
-    )
+        observation_arrays = {
+            "candidate_points": candidate_points,
+            "candidate_covariance": candidate_covariance,
+            "network_current_uv": network_current_uv,
+            "uv_covariance": uv_covariance,
+            "sampled_disparity": sampled_disparity,
+            "sampled_disparity_variance": sampled_disparity_variance,
+        }
+    else:
+        kernel_size = int(getattr(config, "kernel_size", 31))
+        half = kernel_size // 2
+        candidate_patch_inbound = (
+            (floor_source[:, 0] >= half)
+            & (floor_source[:, 0] < width - half)
+            & (floor_source[:, 1] >= half)
+            & (floor_source[:, 1] < height - half)
+        )
+        current_patch_inbound = (
+            current_inbound
+            & (floor_current[:, 0] >= half)
+            & (floor_current[:, 0] < current_width - half)
+            & (floor_current[:, 1] >= half)
+            & (floor_current[:, 1] < current_height - half)
+        )
+        valid = (
+            candidate_patch_inbound & current_patch_inbound & mask_valid
+            & torch.isfinite(sampled_flow).all(dim=1)
+            & torch.isfinite(sampled_covariance).all(dim=1)
+        )
+        selected_candidate_uv = candidate_uv[source_indices][valid]
+        selected_current_uv = network_current_uv[valid]
+        selected_flow_covariance = sampled_covariance[valid]
+        candidate_depth_map = candidate_frame.depth.detach().cpu().double()
+        assert current_depth_map is not None
+        current_depth_cpu = current_depth_map.detach().cpu().double()
+        candidate_floor = floor_source[valid]
+        selected_current_floor = floor_current[valid]
+        candidate_center_depth = candidate_depth_map[
+            0, 0, candidate_floor[:, 1], candidate_floor[:, 0]
+        ]
+        current_center_depth = current_depth_cpu[
+            0, 0, selected_current_floor[:, 1], selected_current_floor[:, 0]
+        ]
+        candidate_center_depth_covariance = None
+        if candidate_frame.depth_covariance is not None:
+            cached_depth_covariance = candidate_frame.depth_covariance.detach().cpu().double()
+            candidate_center_depth_covariance = cached_depth_covariance[
+                0, 0, candidate_floor[:, 1], candidate_floor[:, 0]
+            ]
+        current_center_depth_covariance = None
+        current_depth_covariance_map = getattr(depth_current, "cov", None)
+        if current_depth_covariance_map is not None:
+            current_depth_covariance_cpu = current_depth_covariance_map.detach().cpu().double()
+            current_center_depth_covariance = current_depth_covariance_cpu[
+                0, 0, selected_current_floor[:, 1], selected_current_floor[:, 0]
+            ]
+        candidate_intrinsic = (
+            candidate_frame.intrinsic[0]
+            if candidate_frame.intrinsic.ndim == 3 else candidate_frame.intrinsic
+        ).detach().cpu().double()
+        fixed_candidate_covariance = torch.zeros(
+            (len(selected_candidate_uv), 3), dtype=torch.float64,
+        )
+        fixed_candidate_covariance[:, :2] = 0.25
+        covariance_parameters = {
+            "kernel_size": kernel_size,
+            "match_cov_default": float(getattr(config, "match_cov_default", 0.25)),
+            "min_position_std": float(getattr(config, "min_flow_cov", 0.25)),
+            "min_depth_variance": float(getattr(config, "min_depth_cov", 0.05)),
+        }
+        try:
+            candidate_wavg, candidate_wvar, candidate_covariance = (
+                match_covariance_local_statistics(
+                    kp=selected_candidate_uv,
+                    depth=candidate_depth_map,
+                    depth_covariance=candidate_center_depth_covariance,
+                    position_covariance=fixed_candidate_covariance,
+                    fx=candidate_intrinsic[0, 0], fy=candidate_intrinsic[1, 1],
+                    cx=candidate_intrinsic[0, 2], cy=candidate_intrinsic[1, 2],
+                    device=torch.device("cpu"), **covariance_parameters,
+                )
+            )
+            current_wavg, current_wvar, current_covariance = (
+                match_covariance_local_statistics(
+                    kp=selected_current_uv,
+                    depth=current_depth_cpu,
+                    depth_covariance=current_center_depth_covariance,
+                    position_covariance=selected_flow_covariance,
+                    fx=intrinsic[0, 0], fy=intrinsic[1, 1],
+                    cx=intrinsic[0, 2], cy=intrinsic[1, 2],
+                    device=torch.device("cpu"), **covariance_parameters,
+                )
+            )
+        except (IndexError, RuntimeError, ValueError) as error:
+            refinement["reason"] = f"local_depth_covariance_failed:{error}"
+            row.update({"information_valid": False, "pgo_comparison_eligible": False})
+            return GeometryResult(row, None, None)
+        candidate_points = pixel2point_NED(
+            selected_candidate_uv, candidate_center_depth, candidate_intrinsic,
+        ).double()
+        current_points = pixel2point_NED(
+            selected_current_uv, current_center_depth, intrinsic,
+        ).double()
+        finite_icp = (
+            torch.isfinite(candidate_points).all(dim=1)
+            & torch.isfinite(current_points).all(dim=1)
+            & torch.isfinite(candidate_covariance).all(dim=(1, 2))
+            & torch.isfinite(current_covariance).all(dim=(1, 2))
+            & torch.isfinite(candidate_wavg) & torch.isfinite(candidate_wvar)
+            & torch.isfinite(current_wavg) & torch.isfinite(current_wvar)
+            & (candidate_center_depth > 0.0) & (current_center_depth > 0.0)
+        )
+        observation_arrays = {
+            "candidate_points": candidate_points[finite_icp],
+            "candidate_covariance": candidate_covariance[finite_icp],
+            "current_points": current_points[finite_icp],
+            "current_covariance": current_covariance[finite_icp],
+        }
+        refinement.update({
+            "kernel_size": kernel_size,
+            "candidate_position_covariance": "fixed_0.25I",
+            "local_depth_candidate_points": int(len(candidate_points)),
+            "local_depth_current_points": int(len(current_points)),
+            "local_depth_valid_points": int(finite_icp.sum()),
+        })
+        valid_count = int(finite_icp.sum())
     refinement.update({
         "pnp_positive_inlier_sources": int(len(candidate_local)),
         "candidate_inbound": int(candidate_inbound.sum()),
-        "flow_and_disparity_valid": int(valid.sum()),
+        "flow_and_disparity_valid": int(valid.sum()) if residual_mode == "disp" else None,
+        "flow_and_icp_valid": valid_count if residual_mode == "icp" else None,
         "match_mask_present": getattr(match, "mask", None) is not None,
     })
     flow_orb_difference = torch.linalg.vector_norm(
@@ -785,33 +976,42 @@ def refine_geometry_with_network(
         ),
     }
     minimum = int(getattr(config, "min_points", 6))
-    if int(valid.sum()) < minimum:
+    available = int(valid.sum()) if residual_mode == "disp" else valid_count
+    if available < minimum:
         refinement["reason"] = "insufficient_valid_flow_refinement_points"
         row.update({"information_valid": False, "pgo_comparison_eligible": False})
         return GeometryResult(row, None, None)
 
-    candidate_points = candidate_points[valid]
-    candidate_covariance = candidate_covariance[valid]
-    network_current_uv = network_current_uv[valid]
-    uv_covariance = uv_covariance[valid]
-    sampled_disparity = sampled_disparity[valid]
-    sampled_disparity_variance = sampled_disparity_variance[valid]
-    intrinsic = (
-        current_frame.intrinsic[0]
-        if current_frame.intrinsic.ndim == 3 else current_frame.intrinsic
-    ).detach().cpu().double()
+    if residual_mode == "disp":
+        observation_arrays = {
+            name: value[valid] for name, value in observation_arrays.items()
+        }
     baseline = current_frame.baseline.detach().cpu().double()
-    huber_delta = float(getattr(config, "huber_delta", 2.795))
+
+    def select_observations(mask: torch.Tensor) -> None:
+        nonlocal observation_arrays
+        observation_arrays = {
+            name: value[mask] for name, value in observation_arrays.items()
+        }
 
     def system_at(pose: pp.LieTensor):
+        if residual_mode == "icp":
+            return robust_icp_observation_system(
+                pose,
+                observation_arrays["candidate_points"],
+                observation_arrays["candidate_covariance"],
+                observation_arrays["current_points"],
+                observation_arrays["current_covariance"],
+                huber_delta,
+            )
         return robust_observation_system(
             pose,
-            candidate_points,
-            candidate_covariance,
-            network_current_uv,
-            uv_covariance,
-            sampled_disparity,
-            sampled_disparity_variance,
+            observation_arrays["candidate_points"],
+            observation_arrays["candidate_covariance"],
+            observation_arrays["network_current_uv"],
+            observation_arrays["uv_covariance"],
+            observation_arrays["sampled_disparity"],
+            observation_arrays["sampled_disparity_variance"],
             intrinsic,
             baseline,
             huber_delta,
@@ -820,17 +1020,26 @@ def refine_geometry_with_network(
     initial_pose = result.pnp_pose_current_candidate.detach().cpu().double()
     pose = initial_pose
     try:
-        _, _, initial_covariance, _ = reproj_disp_linearization(
-            pose,
-            candidate_points,
-            candidate_covariance,
-            network_current_uv,
-            uv_covariance,
-            sampled_disparity,
-            sampled_disparity_variance,
-            intrinsic,
-            baseline,
-        )
+        if residual_mode == "icp":
+            _, _, initial_covariance, _ = icp_linearization(
+                pose,
+                observation_arrays["candidate_points"],
+                observation_arrays["candidate_covariance"],
+                observation_arrays["current_points"],
+                observation_arrays["current_covariance"],
+            )
+        else:
+            _, _, initial_covariance, _ = reproj_disp_linearization(
+                pose,
+                observation_arrays["candidate_points"],
+                observation_arrays["candidate_covariance"],
+                observation_arrays["network_current_uv"],
+                observation_arrays["uv_covariance"],
+                observation_arrays["sampled_disparity"],
+                observation_arrays["sampled_disparity_variance"],
+                intrinsic,
+                baseline,
+            )
     except (RuntimeError, ValueError) as error:
         refinement["reason"] = f"initial_covariance_linearization_failed:{error}"
         row.update({"information_valid": False, "pgo_comparison_eligible": False})
@@ -855,12 +1064,7 @@ def refine_geometry_with_network(
         row.update({"information_valid": False, "pgo_comparison_eligible": False})
         return GeometryResult(row, None, None)
     if not bool(covariance_spd.all()):
-        candidate_points = candidate_points[covariance_spd]
-        candidate_covariance = candidate_covariance[covariance_spd]
-        network_current_uv = network_current_uv[covariance_spd]
-        uv_covariance = uv_covariance[covariance_spd]
-        sampled_disparity = sampled_disparity[covariance_spd]
-        sampled_disparity_variance = sampled_disparity_variance[covariance_spd]
+        select_observations(covariance_spd)
 
     try:
         initial_system = system_at(pose)
@@ -874,12 +1078,7 @@ def refine_geometry_with_network(
         row.update({"information_valid": False, "pgo_comparison_eligible": False})
         return GeometryResult(row, None, None)
     if not bool(positive.all()):
-        candidate_points = candidate_points[positive]
-        candidate_covariance = candidate_covariance[positive]
-        network_current_uv = network_current_uv[positive]
-        uv_covariance = uv_covariance[positive]
-        sampled_disparity = sampled_disparity[positive]
-        sampled_disparity_variance = sampled_disparity_variance[positive]
+        select_observations(positive)
         initial_system = system_at(pose)
 
     initial_cost = initial_system.robust_cost
@@ -952,12 +1151,7 @@ def refine_geometry_with_network(
         return GeometryResult(row, None, None)
     comparison_initial_cost = initial_cost
     if not bool(final_positive.all()):
-        candidate_points = candidate_points[final_positive]
-        candidate_covariance = candidate_covariance[final_positive]
-        network_current_uv = network_current_uv[final_positive]
-        uv_covariance = uv_covariance[final_positive]
-        sampled_disparity = sampled_disparity[final_positive]
-        sampled_disparity_variance = sampled_disparity_variance[final_positive]
+        select_observations(final_positive)
         try:
             comparison_initial_cost = system_at(initial_pose).robust_cost
             final_system = system_at(pose)
@@ -998,7 +1192,7 @@ def refine_geometry_with_network(
     information, information_payload = information_diagnostics(
         final_system,
         pose,
-        point_count=len(candidate_points),
+        point_count=len(observation_arrays["candidate_points"]),
     )
     if information is None:
         refinement["reason"] = information_payload.get("reason")
@@ -1016,7 +1210,7 @@ def refine_geometry_with_network(
         "accepted_steps": accepted_steps,
         "rejected_trials": rejected_trials,
         "converged": converged,
-        "final_point_count": len(candidate_points),
+        "final_point_count": len(observation_arrays["candidate_points"]),
     })
     row.update({
         "status": "accepted",
@@ -1032,7 +1226,7 @@ def refine_geometry_with_network(
         result.constraint,
         relative_pose=row["relative_pose"],
         information=fixed_information.detach().cpu().tolist(),
-        num_flow_points=len(candidate_points),
+        num_flow_points=len(observation_arrays["candidate_points"]),
     )
     return GeometryResult(
         row,

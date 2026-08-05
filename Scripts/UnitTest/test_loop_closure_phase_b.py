@@ -21,6 +21,7 @@ from Module.LoopClosure.Verification import (
 from Module.Map import VisualMap
 from Module.Map.Template import FrameNode
 from Scripts.AdHoc.RunLoopPhaseBOffline import (
+    _configured_observation_residual_mode,
     _load_visual_map,
     evaluate_gt_pose_proxy,
     limit_queries,
@@ -29,6 +30,14 @@ from Scripts.AdHoc.RunLoopPhaseBOffline import (
 
 
 _MISSING = object()
+
+
+def test_missing_global_pgo_defaults_observation_mode_to_disp() -> None:
+    assert _configured_observation_residual_mode(SimpleNamespace()) == "disp"
+    configured = SimpleNamespace(
+        global_pgo=SimpleNamespace(observation_residual_mode="icp"),
+    )
+    assert _configured_observation_residual_mode(configured) == "icp"
 
 
 def test_offline_visual_map_loader_restores_observation_graph(tmp_path: Path) -> None:
@@ -206,6 +215,15 @@ def test_vins_network_refinement_is_optional_and_validated(tmp_path: Path) -> No
     )
     LoopClosureManager.is_valid_config(enabled)
 
+    icp = make_config(tmp_path)
+    icp.vins_geometry = vins_geometry_config("orb_detected", "orbslam")
+    icp.vins_geometry.network_refinement = SimpleNamespace(
+        enabled=True, residual_mode="icp", min_points=6, huber_delta=2.795,
+        max_iterations=15, damping_initial=1e-3, kernel_size=31,
+        match_cov_default=0.25, min_depth_cov=0.05, min_flow_cov=0.25,
+    )
+    LoopClosureManager.is_valid_config(icp)
+
     invalid = make_config(tmp_path)
     invalid.vins_geometry = vins_geometry_config("orb_detected", "orbslam")
     invalid.vins_geometry.network_refinement = SimpleNamespace(
@@ -217,6 +235,10 @@ def test_vins_network_refinement_is_optional_and_validated(tmp_path: Path) -> No
     )
     with pytest.raises(ValueError):
         LoopClosureManager.is_valid_config(invalid)
+
+    icp.vins_geometry.network_refinement.residual_mode = "unknown"
+    with pytest.raises(ValueError):
+        LoopClosureManager.is_valid_config(icp)
 
 
 def make_record(sensor_idx: int, visual_idx: int, loop_idx: int, height: int = 12, width: int = 12) -> LoopFrameRecord:

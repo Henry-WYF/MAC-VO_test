@@ -111,6 +111,79 @@ class DepthCovariance(ICovariance2to3):
         })
 
 
+def match_covariance_local_statistics(
+    *,
+    kp: torch.Tensor,
+    depth: torch.Tensor,
+    depth_covariance: torch.Tensor | None,
+    position_covariance: torch.Tensor | None,
+    kernel_size: int,
+    match_cov_default: float,
+    min_position_std: float,
+    min_depth_variance: float,
+    fx: torch.Tensor | float,
+    fy: torch.Tensor | float,
+    cx: torch.Tensor | float,
+    cy: torch.Tensor | float,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Shared implementation of MAC-VO's match-conditioned local depth model.
+
+    The returned 3D covariance uses the locally weighted depth mean and spatial
+    variance exactly like :class:`MatchCovariance`.  The 3D point coordinate is
+    intentionally not returned: callers must inverse-project the centre pixel
+    with its centre depth, matching the original observation construction.
+    """
+    if kernel_size <= 0 or kernel_size % 2 != 1:
+        raise ValueError("kernel_size must be a positive odd integer")
+    n_sample = int(kp.size(0))
+    kp = kp.to(device=device)
+    depth = depth.to(device=device)
+    kp_long = kp.clone().long()
+    has_position_covariance = position_covariance is not None
+    if position_covariance is None:
+        covariance = torch.full(
+            (n_sample, 3), float(match_cov_default),
+            device=device, dtype=torch.float,
+        )
+        covariance[..., 2] = 0.0
+    else:
+        covariance = position_covariance.to(device=device).clone()
+        # Preserve the original minimum standard-deviation convention.
+        covariance[..., :2].clamp_(min=float(min_position_std) ** 2)
+
+    var_u, var_v, var_uv = (
+        covariance[..., 0], covariance[..., 1], covariance[..., 2],
+    )
+    half = kernel_size // 2
+    offsets = torch.arange(-half, half + 1, dtype=torch.long, device=device)
+    uu, vv = torch.meshgrid(offsets, offsets, indexing="ij")
+    all_u = kp_long[:, 0].unsqueeze(-1) + uu.reshape(1, -1)
+    all_v = kp_long[:, 1].unsqueeze(-1) + vv.reshape(1, -1)
+    cov_matrices = create_2x2_matrix(
+        [[var_u, var_uv], [var_uv, var_v]], n_sample=n_sample, device=device,
+    )
+    local_filters = gaussain_full_kernels(cov_matrices, kernel_size=kernel_size)
+    patches = depth[..., all_v, all_u].view(n_sample, kernel_size, kernel_size)
+    patches = patches.permute(0, 2, 1)
+    weighted_depth = (local_filters * patches).sum(dim=(1, 2))
+    if has_position_covariance or depth_covariance is None:
+        weighted_variance = torch.sum(
+            local_filters
+            * (patches - weighted_depth.unsqueeze(1).unsqueeze(1)).square(),
+            dim=(1, 2),
+        )
+    else:
+        weighted_variance = depth_covariance.to(device=device)
+    weighted_variance = weighted_variance.clamp(min=float(min_depth_variance))
+    covariance_3d = Covariance_2to3_full(
+        var_u, var_uv, var_v, weighted_variance,
+        kp[..., 0], kp[..., 1], weighted_depth,
+        fx, fy, cx, cy,
+    ).double()
+    return weighted_depth, weighted_variance, covariance_3d
+
+
 class MatchCovariance(ICovariance2to3):
     """
     Covariance model used by MAC-VO. See section III.C for detail.
@@ -122,62 +195,21 @@ class MatchCovariance(ICovariance2to3):
     @Timer.cpu_timeit("Cov Model")
     @Timer.gpu_timeit("Cov Model")
     def estimate(self, frame: StereoData, kp: torch.Tensor, depth_est: IStereoDepth.Output, depth_cov: torch.Tensor | None, flow_cov: torch.Tensor | None) -> torch.Tensor:        
-        n_sample = kp.size(0)
-
-        kp_long = kp.clone().long()
-        if (has_flow_cov_flag := flow_cov is not None):
-            # Min clamp to 0.16 since camera plane is descretelized by pixels, which has at least an
-            # uncertainty of 0.16
-            flow_cov[..., :2].clamp_(min=self.config.min_flow_cov**2)
-        else:
-            flow_cov = torch.ones((n_sample, 3), device=torch.device(self.config.device), dtype=torch.float) * self.config.match_cov_default
-            assert flow_cov is not None
-            flow_cov[..., 2] = 0.
-
-        var_u, var_v, var_uv = flow_cov[..., 0], flow_cov[..., 1], flow_cov[..., 2]
-        kp_u, kp_v = kp[..., 0], kp[..., 1]
-
-        # Get local depth average and variance
-        u_indices = torch.arange(
-            -self.config.kernel_size_hlf, self.config.kernel_size_hlf + 1, dtype=torch.long, device=torch.device(self.config.device)
+        _, _, cov = match_covariance_local_statistics(
+            kp=kp,
+            depth=depth_est.depth,
+            depth_covariance=depth_cov,
+            position_covariance=flow_cov,
+            kernel_size=int(self.config.kernel_size),
+            match_cov_default=float(self.config.match_cov_default),
+            min_position_std=float(self.config.min_flow_cov),
+            min_depth_variance=float(self.config.min_depth_cov),
+            fx=frame.fx,
+            fy=frame.fy,
+            cx=frame.cx,
+            cy=frame.cy,
+            device=torch.device(self.config.device),
         )
-        v_indices = torch.arange(
-            -self.config.kernel_size_hlf, self.config.kernel_size_hlf + 1, dtype=torch.long, device=torch.device(self.config.device)
-        )
-        uu, vv = torch.meshgrid(u_indices, v_indices, indexing="ij")
-
-        all_u_indices = kp_long[:, 0].unsqueeze(-1) + uu.reshape(1, -1)
-        all_v_indices = kp_long[:, 1].unsqueeze(-1) + vv.reshape(1, -1)
-
-        cov_matrices = create_2x2_matrix([[var_u, var_uv], [var_uv, var_v]], n_sample=n_sample, device=torch.device(self.config.device))
-        local_filters = gaussain_full_kernels(cov_matrices, kernel_size=self.config.kernel_size)
-        
-        patches = depth_est.depth[..., all_v_indices, all_u_indices].view(
-            n_sample, self.config.kernel_size, self.config.kernel_size
-        ).to(self.config.device)
-        patches = patches.permute(0, 2, 1)
-
-        # Weighted Average
-        wavg_depth = (local_filters * patches).sum(dim=[1, 2])
-        if (has_flow_cov_flag or (depth_cov is None)):
-            # Weighted Variance
-            wvar_depth = torch.sum(
-                local_filters * (patches - (wavg_depth.unsqueeze(1).unsqueeze(1))).square(),
-                dim=[1, 2],
-            )
-        else:
-            assert depth_cov is not None
-            wvar_depth = depth_cov
-        
-        wvar_depth = wvar_depth.clamp(min=self.config.min_depth_cov)
-
-        # Inverse project 2D keypoint to 3D space.
-        cov = Covariance_2to3_full(
-            var_u, var_uv, var_v, wvar_depth,
-            kp_u, kp_v, wavg_depth,
-            frame.fx, frame.fy, frame.cx, frame.cy
-        ).double()
-
         return cov
     
     @classmethod

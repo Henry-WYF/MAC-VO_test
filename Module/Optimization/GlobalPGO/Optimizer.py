@@ -41,6 +41,9 @@ class GlobalPoseGraphOptimizer(ConfigTestable):
         self.observation_huber_delta: float = float(
             getattr(config, "observation_huber_delta", 2.795)
         )
+        self.observation_residual_mode: str = str(
+            getattr(config, "observation_residual_mode", "disp")
+        )
         sparse = getattr(config, "sparse_lm", SimpleNamespace())
         self.sparse_initial_damping = float(getattr(sparse, "initial_damping", 1e-3))
         self.sparse_min_damping = float(getattr(sparse, "min_damping", 1e-9))
@@ -79,6 +82,7 @@ class GlobalPoseGraphOptimizer(ConfigTestable):
             and not isinstance(value, bool) and value > 0.0,
             "observation_huber_delta": lambda value: isinstance(value, (int, float))
             and not isinstance(value, bool) and value > 0.0,
+            "observation_residual_mode": lambda value: value in {"disp", "icp"},
             "sparse_lm": lambda value: isinstance(value, SimpleNamespace),
         }
         for key, predicate in optional.items():
@@ -192,6 +196,7 @@ class GlobalPoseGraphOptimizer(ConfigTestable):
                         src,
                         dst,
                         huber_delta=self.observation_huber_delta,
+                        residual_mode=self.observation_residual_mode,
                     )
                 except Exception as error:
                     information = None

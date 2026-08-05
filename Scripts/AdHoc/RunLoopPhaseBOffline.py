@@ -20,6 +20,7 @@ from Module.LoopClosure.VINSGeometry import (
     ORB_SLAM_ORIENTATION_BINS,
     ORB_SLAM_ORIENTATION_WEAK_BIN_RATIO,
     ORB_SLAM_RATIO_THRESHOLD,
+    network_refinement_contract,
     run_pose_copy_pgo_comparison,
 )
 from Module.Map import VisualMap
@@ -486,6 +487,11 @@ def _load_visual_map(path: Path) -> VisualMap:
     return global_map
 
 
+def _configured_observation_residual_mode(odometry_config: Any) -> str:
+    global_pgo_config = getattr(odometry_config, "global_pgo", None)
+    return str(getattr(global_pgo_config, "observation_residual_mode", "disp"))
+
+
 def _aligned_reference_poses(global_map: VisualMap, ref_poses_path: Path) -> torch.Tensor | None:
     if not ref_poses_path.is_file():
         return None
@@ -646,6 +652,30 @@ def main() -> None:
             False,
         )
     )
+    refinement_config = (
+        getattr(loop_config.vins_geometry, "network_refinement", None)
+        if vins_mode else None
+    )
+    refinement_contract = network_refinement_contract(
+        refinement_config if network_refinement_enabled else None,
+    )
+    vo_graph_type = str(config.Odometry.optimizer.args.graph_type)
+    global_pgo_config = getattr(config.Odometry, "global_pgo", None)
+    odometry_residual_mode = _configured_observation_residual_mode(config.Odometry)
+    if refinement_contract["loop_residual_mode"] == "icp":
+        if vo_graph_type != "icp":
+            raise ValueError("ICP loop refinement requires source VO graph_type=icp")
+        if odometry_residual_mode != "icp":
+            raise ValueError(
+                "ICP loop refinement requires global_pgo "
+                "observation_residual_mode=icp"
+            )
+        if str(config.Odometry.cov.obs.type) != "MatchCovariance":
+            raise ValueError("ICP loop refinement requires MatchCovariance observations")
+        observation_config = config.Odometry.cov.obs.args
+        for field in ("kernel_size", "match_cov_default", "min_depth_cov", "min_flow_cov"):
+            if getattr(refinement_config, field) != getattr(observation_config, field):
+                raise ValueError(f"loop and odometry covariance setting {field} differ")
     frontend = (
         None
         if vins_mode and not network_refinement_enabled
@@ -674,7 +704,6 @@ def main() -> None:
         raise RuntimeError("offline Phase B verification modified VisualMap poses")
     pose_copy_pgo = None
     if vins_mode:
-        global_pgo_config = getattr(config.Odometry, "global_pgo", None)
         pose_copy_pgo = (
             run_vins_pose_copy_pgo(
                 global_map,
@@ -770,6 +799,9 @@ def main() -> None:
             if hasattr(loop_config, "vins_geometry") else None
         ),
         "vins_geometry_network_refinement_enabled": network_refinement_enabled,
+        "vo_graph_type": vo_graph_type,
+        "odometry_residual_mode": odometry_residual_mode,
+        **refinement_contract,
         "vins_geometry_descriptor_match_parameters": (
             {
                 "distance_threshold_inclusive": ORB_SLAM_HAMMING_THRESHOLD,

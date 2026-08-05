@@ -69,7 +69,7 @@ Odometry:
       device: cpu
       vectorize: true
       parallel: true
-      graph_type: disp
+      graph_type: icp
       autodiff: false
 
   loop_closure:
@@ -107,10 +107,15 @@ Odometry:
       max_rotation_deg: 180.0
       network_refinement:
         enabled: true
+        residual_mode: icp
         min_points: 6
         huber_delta: 2.795
         max_iterations: 15
         damping_initial: 0.001
+        kernel_size: 31
+        match_cov_default: 0.25
+        min_depth_cov: 0.05
+        min_flow_cov: 0.25
 
     geometry:
       min_points: 30
@@ -177,7 +182,7 @@ Odometry:
   global_pgo:
     enabled: false
     optimize_on_terminate: false
-    max_iterations: 50
+    max_iterations: 2000
     trans_weight: 100.0
     rot_weight: 100.0
     device: cpu
@@ -185,6 +190,7 @@ Odometry:
     solver: sparse_lm
     loop_huber_delta: 3.548
     observation_huber_delta: 2.795
+    observation_residual_mode: icp
     sparse_lm:
       initial_damping: 0.001
       min_damping: 1.0e-9

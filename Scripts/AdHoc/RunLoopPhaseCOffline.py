@@ -17,10 +17,16 @@ import torch
 import yaml
 
 from Evaluation.MetricsSeq import evaluateATE, evaluateRPE
-from Module.LoopClosure.VINSGeometry import run_pose_copy_pgo_safety
+from Module.LoopClosure.VINSGeometry import (
+    network_refinement_contract,
+    run_pose_copy_pgo_safety,
+)
 from Module.Map import VisualMap
 from Module.Optimization.GlobalPGO import GlobalPoseGraphOptimizer
-from Scripts.AdHoc.RunLoopPhaseBOffline import _load_visual_map
+from Scripts.AdHoc.RunLoopPhaseBOffline import (
+    _configured_observation_residual_mode,
+    _load_visual_map,
+)
 from Utility.Config import load_config
 from Utility.Sandbox import Sandbox
 from Utility.Trajectory import Trajectory
@@ -159,6 +165,179 @@ def load_phase_c_edges(phase_b_dir: Path) -> tuple[list[dict[str, Any]], list[di
         [fixed_by_key[key] for key in ordered_keys],
         [covariance_by_key[key] for key in ordered_keys],
     )
+
+
+def validate_phase_b_contract(
+    phase_b_dir: Path, source_config: Any,
+) -> dict[str, Any]:
+    documents = {
+        "manifest": _load_json(phase_b_dir / "offline_run_manifest.json"),
+        "verification": _load_json(phase_b_dir / "loop_vins_verification.json"),
+        "fixed": _load_json(phase_b_dir / "loop_constraints_pgo_fixed.json"),
+        "covariance": _load_json(phase_b_dir / "loop_constraints_pgo_covariance.json"),
+    }
+    try:
+        graph_type = str(source_config.Odometry.optimizer.args.graph_type)
+    except AttributeError as error:
+        raise ValueError("source VO config has no optimizer graph_type") from error
+    odometry_residual_mode = _configured_observation_residual_mode(
+        source_config.Odometry,
+    )
+
+    declared_modes = {
+        name: document.get("loop_residual_mode")
+        for name, document in documents.items()
+    }
+    present_modes = {
+        str(mode) for mode in declared_modes.values() if mode is not None
+    }
+    missing_modes = [name for name, mode in declared_modes.items() if mode is None]
+    if not present_modes:
+        contract_fields = (
+            "loop_residual_mode",
+            "observation_covariance_model",
+            "kernel_size",
+            "covariance_config_sha256",
+            "covariance_config",
+            "vo_graph_type",
+            "odometry_residual_mode",
+        )
+        partial_fields = sorted(
+            f"{name}.{field}"
+            for name, document in documents.items()
+            for field in contract_fields
+            if field in document
+        )
+        if partial_fields:
+            raise ValueError(
+                "legacy disp result contains partial contract metadata: "
+                + ", ".join(partial_fields)
+            )
+        # Results produced before the residual-mode metadata was introduced are
+        # the legacy reprojection-disparity ablation. Their source VO config is
+        # still authoritative and must also be disp.
+        loop_residual_mode = "disp"
+        validation_mode = "legacy_disp_source_config"
+    elif missing_modes:
+        raise ValueError(
+            "Phase B residual-mode metadata is only partially present: "
+            + ", ".join(sorted(missing_modes))
+        )
+    elif len(present_modes) != 1:
+        raise ValueError("Phase B loop residual modes disagree")
+    else:
+        loop_residual_mode = next(iter(present_modes))
+        validation_mode = f"explicit_{loop_residual_mode}"
+
+    if loop_residual_mode not in {"disp", "icp"}:
+        raise ValueError(f"unsupported Phase B loop residual mode {loop_residual_mode!r}")
+    if graph_type != loop_residual_mode:
+        raise ValueError(
+            "source VO graph_type disagrees with loop residual mode: "
+            f"{graph_type!r} != {loop_residual_mode!r}"
+        )
+    if odometry_residual_mode != loop_residual_mode:
+        raise ValueError(
+            "global_pgo observation_residual_mode disagrees with loop residual mode: "
+            f"{odometry_residual_mode!r} != {loop_residual_mode!r}"
+        )
+
+    manifest = documents["manifest"]
+    manifest_graph_type = manifest.get("vo_graph_type")
+    if manifest_graph_type is not None and manifest_graph_type != graph_type:
+        raise ValueError("Phase B manifest vo_graph_type disagrees with source config")
+    manifest_odometry_mode = manifest.get("odometry_residual_mode")
+    if manifest_odometry_mode is not None and manifest_odometry_mode != odometry_residual_mode:
+        raise ValueError(
+            "Phase B manifest odometry_residual_mode disagrees with source config"
+        )
+
+    if loop_residual_mode == "disp":
+        # Preserve old and explicit disp ablations. Explicit metadata must still
+        # agree across every Phase B artifact; legacy artifacts have no contract
+        # fields and are validated through their source configuration above.
+        if validation_mode == "legacy_disp_source_config":
+            return {
+                "vo_graph_type": graph_type,
+                "loop_residual_mode": "disp",
+                "odometry_residual_mode": odometry_residual_mode,
+                "observation_covariance_model": "legacy_reprojection_disparity",
+                "kernel_size": None,
+                "covariance_config_sha256": None,
+                "contract_validation": validation_mode,
+            }
+        models = {document.get("observation_covariance_model") for document in documents.values()}
+        hashes = {document.get("covariance_config_sha256") for document in documents.values()}
+        kernels = {document.get("kernel_size") for document in documents.values()}
+        if len(models) != 1 or len(hashes) != 1 or len(kernels) != 1:
+            raise ValueError("Phase B disp covariance contracts disagree")
+        return {
+            "vo_graph_type": graph_type,
+            "loop_residual_mode": "disp",
+            "odometry_residual_mode": odometry_residual_mode,
+            "observation_covariance_model": next(iter(models)),
+            "kernel_size": next(iter(kernels)),
+            "covariance_config_sha256": next(iter(hashes)),
+            "contract_validation": validation_mode,
+        }
+
+    expected_model = "bilateral_match_covariance_3d_independent_sum"
+    hashes: set[str] = set()
+    kernels: set[int] = set()
+    for name, document in documents.items():
+        if document.get("loop_residual_mode") != "icp":
+            raise ValueError(f"{name} does not declare loop_residual_mode=icp")
+        if document.get("observation_covariance_model") != expected_model:
+            raise ValueError(f"{name} has an incompatible observation covariance model")
+        digest = document.get("covariance_config_sha256")
+        kernel = document.get("kernel_size")
+        if not isinstance(digest, str) or not digest:
+            raise ValueError(f"{name} has no covariance_config_sha256")
+        if not isinstance(kernel, int) or kernel <= 0:
+            raise ValueError(f"{name} has no valid covariance kernel_size")
+        hashes.add(digest)
+        kernels.add(kernel)
+    if len(hashes) != 1 or len(kernels) != 1:
+        raise ValueError("Phase B ICP covariance contracts disagree")
+    try:
+        refinement_config = source_config.Odometry.loop_closure.vins_geometry.network_refinement
+        observation_type = str(source_config.Odometry.cov.obs.type)
+        observation_config = source_config.Odometry.cov.obs.args
+    except AttributeError as error:
+        raise ValueError("source config has no ICP covariance settings") from error
+    if observation_type != "MatchCovariance":
+        raise ValueError(f"ICP covariance branch requires MatchCovariance, got {observation_type!r}")
+    source_contract = network_refinement_contract(refinement_config)
+    if source_contract["covariance_config_sha256"] not in hashes:
+        raise ValueError("Phase B covariance digest disagrees with source config")
+    for field in ("kernel_size", "match_cov_default", "min_depth_cov", "min_flow_cov"):
+        if getattr(refinement_config, field) != getattr(observation_config, field):
+            raise ValueError(f"loop and odometry covariance setting {field} differ")
+    if manifest.get("vo_graph_type") != graph_type:
+        raise ValueError("Phase B ICP manifest has no matching vo_graph_type")
+    if manifest.get("odometry_residual_mode") != "icp":
+        raise ValueError(
+            "Phase B ICP manifest must declare odometry_residual_mode=icp"
+        )
+    return {
+        "vo_graph_type": graph_type,
+        "loop_residual_mode": "icp",
+        "odometry_residual_mode": odometry_residual_mode,
+        "observation_covariance_model": expected_model,
+        "kernel_size": next(iter(kernels)),
+        "covariance_config_sha256": next(iter(hashes)),
+        "contract_validation": validation_mode,
+    }
+
+
+def validate_icp_phase_b_contract(
+    phase_b_dir: Path, source_config: Any,
+) -> dict[str, Any]:
+    """Compatibility wrapper retained for callers explicitly requiring ICP."""
+    contract = validate_phase_b_contract(phase_b_dir, source_config)
+    if contract["loop_residual_mode"] != "icp":
+        raise ValueError("Phase B result does not declare loop_residual_mode=icp")
+    return contract
 
 
 def load_phase_c_map(map_path: Path) -> tuple[VisualMap, torch.Tensor, torch.Tensor]:
@@ -409,11 +588,14 @@ def main() -> None:
         phase_b_dir / "loop_constraints_pgo_fixed.json",
         phase_b_dir / "loop_constraints_pgo_covariance.json",
         phase_b_dir / "source_index.json",
+        phase_b_dir / "offline_run_manifest.json",
     )
     for path in required:
         if not path.is_file():
             raise FileNotFoundError(path)
 
+    config, _ = load_config(result_dir / "config.yaml")
+    phase_b_contract = validate_phase_b_contract(phase_b_dir, config)
     verification_rows, fixed_rows, covariance_rows = load_phase_c_edges(phase_b_dir)
     if not fixed_rows:
         comparison = {
@@ -424,6 +606,7 @@ def main() -> None:
             "loop_edge_count": 0,
             "executed": False,
             "reason": "no_pgo_comparison_eligible_edges",
+            **phase_b_contract,
         }
         _write_json(output_dir / "phase_c_comparison.json", comparison)
         with (output_dir / "phase_c_metrics.csv").open("w", encoding="utf-8", newline="") as stream:
@@ -436,7 +619,6 @@ def main() -> None:
     source_poses = np.load(result_dir / "poses.npy", allow_pickle=False)
     validate_source_trajectory(source_poses, initial, body_to_sensor, time_ns)
 
-    config, _ = load_config(result_dir / "config.yaml")
     pgo_config = config.Odometry.global_pgo
     fixed_optimizer, covariance_optimizer = build_pgo_pair(
         global_map, pgo_config, fixed_rows, covariance_rows,
@@ -464,6 +646,7 @@ def main() -> None:
         "source_result_dir": str(result_dir),
         "source_phase_b_dir": str(phase_b_dir),
         "code_commit": _git_commit(Path(__file__).resolve().parents[2]),
+        **phase_b_contract,
     }
     branches = {
         "no_loop": None,
