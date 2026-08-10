@@ -1,0 +1,103 @@
+# MACVO_Performant VO is preserved exactly; only loop-closure and disabled
+# offline GlobalPGO configuration are appended below.
+
+Common:
+  device: &device cuda
+
+Odometry:
+  name: MACVO-Performant
+  args:
+    device: *device
+    edgewidth: 32
+    num_point: 200
+    match_cov_default: 0.25
+    profile: false
+    mapping: true
+
+  cov:
+    obs:
+      type: MatchCovariance
+      args:
+        device: *device
+        kernel_size: 31
+        match_cov_default: 0.25
+        min_depth_cov: 0.05
+        min_flow_cov: 0.25
+
+  keypoint:
+    type: CovAwareSelector_NoDepth
+    args:
+      device: *device
+      kernel_size: 7
+      mask_width: 32
+      max_match_cov: 100.0
+
+  mappoint:
+    type: MappingPointSelector
+    args:
+      device: *device
+      max_depth: 5.0
+      max_depth_cov: 0.005
+      mask_width: 32
+
+  frontend:
+    type: CUDAGraph_FlowFormerCovFrontend
+    args:
+      device: *device
+      weight: ./Model/MACVO_FrontendCov.pth
+      enc_dtype: fp32
+      dec_dtype: fp32
+      decoder_depth: 12
+      enforce_positive_disparity: false
+
+  motion:
+    type: StaticMotionModel
+    args:
+
+  outlier:
+    type: CovarianceSanityFilter
+    args:
+
+  postprocess:
+    type: MotionInterpolate
+    args:
+
+  keyframe:
+    type: AllKeyframe
+    args:
+
+  optimizer:
+    type: TwoFrame_PGO
+    args:
+      device: cpu
+      vectorize: true
+      parallel: true
+      graph_type: disp
+      autodiff: false
+
+  loop_closure: !include ./LoopClosure/DBoW2_ORB_Disp.yaml
+
+  # Disabled online; Phase B/C reuse this configuration on pose copies only.
+  global_pgo:
+    enabled: false
+    optimize_on_terminate: false
+    max_iterations: 2000
+    trans_weight: 100.0
+    rot_weight: 100.0
+    device: cpu
+    include_interp_frames: false
+    solver: sparse_lm
+    loop_huber_delta: 3.548
+    observation_huber_delta: 2.795
+    observation_residual_mode: disp
+    sparse_lm:
+      initial_damping: 0.001
+      min_damping: 1.0e-9
+      max_damping: 1.0e9
+      damping_up: 10.0
+      damping_down: 3.0
+      max_trials: 5
+      jacobian_epsilon: 1.0e-6
+
+Data: !include ../../Sequence/TartanAir_example.yaml
+Preprocess: !include ../Common/Preprocess.yaml

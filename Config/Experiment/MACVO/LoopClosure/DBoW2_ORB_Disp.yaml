@@ -1,0 +1,99 @@
+enabled: true
+recognizer_type: dbow2_orb
+vocabulary_path: ./Model/ORBvoc.txt
+bow_min_score: null
+keyframe_stride_sensor_frames: 5
+temporal_exclusion_sensor_frames: 100
+cache_failure_policy: disable_loop
+orb_nfeatures: 1000
+orb_scale_factor: 1.2
+orb_nlevels: 8
+top_k: 10
+
+geometric_verification:
+  enabled: true
+  max_candidates_to_verify: 10
+  min_sensor_gap: 100
+  compare_flow_cov_gate: false
+
+vins_geometry:
+  enabled: true
+  feature_source: orb_detected
+  descriptor_match_mode: orbslam
+  max_candidates: 10
+  hamming_threshold: 80
+  iterations: 100
+  reproj_error_px: 10.0
+  confidence: 0.99
+  min_inliers: 25
+  max_translation_m: 20.0
+  max_rotation_deg: 180.0
+  network_refinement:
+    enabled: true
+    residual_mode: disp
+    min_points: 6
+    huber_delta: 2.795
+    max_iterations: 15
+    damping_initial: 0.001
+    kernel_size: 31
+    match_cov_default: 0.25
+    min_depth_cov: 0.05
+    min_flow_cov: 0.25
+
+geometry:
+  min_points: 30
+  max_points: 800
+  max_depth: 20.0
+  max_depth_cov: 0.05
+  flow_cov_gate_enabled: false
+  flow_cov_adaptive_target_points: 100
+  max_flow_cov: 100.0
+  border: 8
+  grid_rows: 8
+  grid_cols: 8
+  max_points_per_cell: 20
+
+pnp:
+  reproj_error_px: 3.0
+  confidence: 0.999
+  iterations: 100
+  min_inliers: 20
+  min_inlier_ratio: 0.25
+  refine: true
+
+verification:
+  max_mean_reproj_error_px: 3.0
+  max_rotation_diff_deg: 35.0
+  max_translation_diff_m: 8.0
+
+loop_information:
+  trans_weight: 100.0
+  rot_weight: 100.0
+
+# Retained for reproducibility only; the ORB-to-ORB route above is primary.
+phase_b5:
+  enabled: false
+  mode: disabled
+  trusted_manifest: null
+  calibration:
+    prefix_fraction: 0.2
+    min_queries: 20
+    min_all_bow_pairs: 100
+    min_orb_pairs: 30
+    absolute_median_log_risk_cap: null
+    absolute_q95_log_risk_cap: null
+  orb:
+    ratio: 0.8
+    max_depth: 20.0
+  flow:
+    min_valid_points: 30
+    min_valid_ratio: 0.8
+    min_grid_cells: 8
+    nms_kernel_size: 7
+    border: 8
+    min_points: 30
+    max_points: 800
+    max_depth: 20.0
+    grid_rows: 8
+    grid_cols: 8
+    max_points_per_cell: 20
